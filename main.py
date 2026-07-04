@@ -440,19 +440,55 @@ class WindowBot:
         return next_time
 
     def _daily_realized_pnl(self) -> float:
-        """Rough realized PnL from stop fills today."""
+        """Calculate accurate realized PnL from completed trades today.
+
+        Matches stop fills with entry fills using ticker and timestamp to compute
+        exact profit/loss per trade.
+        """
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         pnl = 0.0
-        for event in self.trade_log.read_events("stop_fill"):
-            if event.get("ts", "").startswith(today):
-                # Approximate loss: side determines sign
-                side = event.get("side", "")
-                fill_price = float(event.get("fill_price", 0))
-                fill_count = float(event.get("fill_count", 0))
-                # For stops, a fill means we exited. Loss magnitude depends on entry.
-                # Without entry price in event, use stop width as rough estimate.
-                if side:
-                    pnl -= self.config.stop_width * fill_count
+
+        # Read all entry and stop fills from today
+        entry_fills = []
+        stop_fills = []
+
+        for event in self.trade_log.read_events("fill"):
+            if not event.get("ts", "").startswith(today):
+                continue
+            if event.get("fill_side") == "maker":  # entry fill
+                entry_fills.append(event)
+            elif event.get("fill_side") == "taker":  # stop fill
+                stop_fills.append(event)
+
+        # Match stop fills to entry fills by ticker and time
+        # Since entries and stops are paired 1:1 per position, match by ticker and time proximity
+        for stop_event in stop_fills:
+            stop_ticker = stop_event["ticker"]
+            stop_price = float(stop_event["fill_price"])
+            stop_count = float(stop_event["fill_count"])
+            stop_ts = datetime.fromisoformat(stop_event["ts"])
+
+            # Find matching entry fill (same ticker, earliest entry before stop)
+            matching_entry = None
+            for entry_event in entry_fills:
+                if entry_event["ticker"] == stop_ticker:
+                    entry_ts = datetime.fromisoformat(entry_event["ts"])
+                    if entry_ts < stop_ts:  # entry before stop
+                        if matching_entry is None or entry_ts > matching_entry["ts"]:
+                            matching_entry = entry_event
+
+            if matching_entry:
+                entry_price = float(matching_entry["fill_price"])
+                entry_count = float(matching_entry["fill_count"])
+                # Ensure counts match (should be equal for full position closing)
+                count = min(entry_count, stop_count)
+                # Calculate PnL: exit - entry
+                if matching_entry["side"] == "bid":  # long YES
+                    trade_pnl = (stop_price - entry_price) * count
+                else:  # long NO (short YES)
+                    trade_pnl = (entry_price - stop_price) * count
+                pnl += trade_pnl
+
         return pnl
 
     async def _shutdown_bot(self, ws_task: asyncio.Task) -> None:
