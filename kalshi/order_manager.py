@@ -1,6 +1,7 @@
 """Order placement, fill handling, and stop-loss management."""
 
 import logging
+import threading
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -13,9 +14,9 @@ from storage.trade_log import TradeLog
 logger = logging.getLogger(__name__)
 
 
-def _fmt_decimal(value: Decimal | float | str, places: int = 4) -> str:
+def _fmt_decimal(value: Decimal | float | str) -> str:
     d = Decimal(str(value))
-    quantized = d.quantize(Decimal("0.01") if places <= 2 else Decimal("0.0001"))
+    quantized = d.quantize(Decimal("0.0001"))
     return f"{quantized:.4f}"
 
 
@@ -54,6 +55,7 @@ class OrderManager:
         self.stop_order_ids: set[str] = set()   # track all stop order_ids
         self.stop_to_parent_entry_price: dict[str, Decimal] = {}  # stop_order_id -> entry_price
         self.settings = get_settings()
+        self._lock = threading.Lock()  # Protect shared state from concurrent access
 
     # ------------------------------------------------------------------
     # Entry placement
@@ -95,10 +97,11 @@ class OrderManager:
             stop_width=stop_width,
             order_id=order_id,
         )
-        self.entries[client_order_id] = entry
-        if order_id:
-            self.order_id_to_client[order_id] = client_order_id
-            self.entry_order_ids.add(order_id)
+        with self._lock:
+            self.entries[client_order_id] = entry
+            if order_id:
+                self.order_id_to_client[order_id] = client_order_id
+                self.entry_order_ids.add(order_id)
 
         self.trade_log.log_event(
             "entry_placed",
@@ -140,9 +143,10 @@ class OrderManager:
             logger.warning("Fill for unknown entry order: order_id=%s client=%s", order_id, client_order_id)
             return
 
-        entry = self.entries[client_order_id]
-        entry.filled_count += Decimal(fill_count)
-        entry.remaining_count = max(Decimal("0"), entry.requested_count - entry.filled_count)
+        with self._lock:
+            entry = self.entries[client_order_id]
+            entry.filled_count += Decimal(fill_count)
+            entry.remaining_count = max(Decimal("0"), entry.requested_count - entry.filled_count)
 
         self.trade_log.log_event(
             "fill",
@@ -176,14 +180,17 @@ class OrderManager:
         asset = "unknown"
         ticker = "unknown"
         side = "unknown"
+        parent_entry_client_order_id = None
         
-        # The stop's client_order_id maps back to the entry via stop_client_order_id
-        for entry in self.entries.values():
-            if entry.stop_client_order_id == client_order_id:
-                asset = entry.asset
-                ticker = entry.ticker
-                side = entry.side
-                break
+        with self._lock:
+            # The stop's client_order_id maps back to the entry via stop_client_order_id
+            for entry in self.entries.values():
+                if entry.stop_client_order_id == client_order_id:
+                    asset = entry.asset
+                    ticker = entry.ticker
+                    side = entry.side
+                    parent_entry_client_order_id = entry.client_order_id
+                    break
 
         # Look up the parent entry price
         entry_price = self.stop_to_parent_entry_price.get(order_id)
@@ -204,6 +211,8 @@ class OrderManager:
                 "fill_side": fill_side,
                 "order_id": order_id,
                 "client_order_id": client_order_id,
+                "parent_entry_client_order_id": parent_entry_client_order_id,
+                "entry_price": entry_price_str,
             },
         )
         logger.info("Stop filled: %s %s %s contracts @ %s (side=%s)", asset, ticker, fill_count, fill_price, fill_side)
@@ -239,8 +248,9 @@ class OrderManager:
         if entry.stop_order_id:
             self._cancel_order(entry.stop_order_id, entry.stop_client_order_id)
             # Clean up old mappings
-            self.order_id_to_client.pop(entry.stop_order_id, None)
-            self.stop_order_ids.discard(entry.stop_order_id)
+            with self._lock:
+                self.order_id_to_client.pop(entry.stop_order_id, None)
+                self.stop_order_ids.discard(entry.stop_order_id)
 
         side = self._stop_side(entry)
         price = self._stop_price(entry)
@@ -260,8 +270,9 @@ class OrderManager:
 
         try:
             response = self.rest.post("/portfolio/events/orders", json_data=payload)
-            entry.stop_order_id = response.get("order_id")
-            entry.stop_client_order_id = client_order_id
+            with self._lock:
+                entry.stop_order_id = response.get("order_id")
+                entry.stop_client_order_id = client_order_id
             status = response.get("status", "")
             
             if not entry.stop_order_id or status in ("canceled", "rejected"):
@@ -275,12 +286,14 @@ class OrderManager:
                 )
                 # Cancel the entry order to prevent further exposure
                 self._emergency_cancel_entry(entry)
-                entry.stop_order_id = None  # Prevent retry attempts
+                with self._lock:
+                    entry.stop_order_id = None  # Prevent retry attempts
                 return
 
             if entry.stop_order_id:
-                self.order_id_to_client[entry.stop_order_id] = client_order_id
-                self.stop_order_ids.add(entry.stop_order_id)
+                with self._lock:
+                    self.order_id_to_client[entry.stop_order_id] = client_order_id
+                    self.stop_order_ids.add(entry.stop_order_id)
 
             filled = Decimal(str(response.get("fill_count", "0")))
             remaining = count - filled
@@ -313,7 +326,8 @@ class OrderManager:
 
             # Track parent entry price for stop
             if entry.stop_order_id:
-                self.stop_to_parent_entry_price[entry.stop_order_id] = entry.entry_price
+                with self._lock:
+                    self.stop_to_parent_entry_price[entry.stop_order_id] = entry.entry_price
 
             if remaining > Decimal("0"):
                 logger.warning(
@@ -321,8 +335,10 @@ class OrderManager:
                     remaining,
                     entry.ticker
                 )
-                # Escalate: double the buffer and retry once
-                escalated_price = self._stop_price(entry) + (Decimal("0.05") if side == "bid" else -Decimal("0.05"))
+                # Escalate: make price more aggressive
+                # For selling (side="bid"): lower price by 0.05
+                # For buying (side="ask"): raise price by 0.05
+                escalated_price = self._stop_price(entry) - (Decimal("0.05") if side == "bid" else -Decimal("0.05"))
                 escalated_payload = {
                     "ticker": entry.ticker,
                     "side": side,
@@ -373,21 +389,22 @@ class OrderManager:
 
     def on_settlement(self, ticker: str, result: str, settlement_price: str | None) -> None:
         """Mark a ticker as settled and clear its entry state."""
-        self.settled_tickers.add(ticker)
-        cleared = []
-        for client_order_id, entry in list(self.entries.items()):
-            if entry.ticker == ticker:
-                # Cancel any resting stop for this entry
-                if entry.stop_order_id:
-                    self._cancel_order(entry.stop_order_id, entry.stop_client_order_id)
-                cleared.append(client_order_id)
+        with self._lock:
+            self.settled_tickers.add(ticker)
+            cleared = []
+            for client_order_id, entry in list(self.entries.items()):
+                if entry.ticker == ticker:
+                    # Cancel any resting stop for this entry
+                    if entry.stop_order_id:
+                        self._cancel_order(entry.stop_order_id, entry.stop_client_order_id)
+                    cleared.append(client_order_id)
 
-        for client_order_id in cleared:
-            entry = self.entries.pop(client_order_id)
-            if entry.order_id:
-                self.order_id_to_client.pop(entry.order_id, None)
-            if entry.stop_order_id:
-                self.order_id_to_client.pop(entry.stop_order_id, None)
+            for client_order_id in cleared:
+                entry = self.entries.pop(client_order_id)
+                if entry.order_id:
+                    self.order_id_to_client.pop(entry.order_id, None)
+                if entry.stop_order_id:
+                    self.order_id_to_client.pop(entry.stop_order_id, None)
 
         self.trade_log.log_event(
             "settlement",
@@ -431,9 +448,10 @@ class OrderManager:
 
     def cancel_all_entries(self) -> None:
         """Cancel all resting entry orders."""
-        for entry in list(self.entries.values()):
-            if entry.order_id and entry.remaining_count > Decimal("0"):
-                self._cancel_order(entry.order_id, entry.client_order_id)
+        with self._lock:
+            for entry in list(self.entries.values()):
+                if entry.order_id and entry.remaining_count > Decimal("0"):
+                    self._cancel_order(entry.order_id, entry.client_order_id)
 
     def reset_window(self) -> None:
         """Clear tracked entries for a new window.
@@ -441,5 +459,9 @@ class OrderManager:
         Note: this should only be called after confirming no positions remain
         for the previous window. State is normally cleared via on_settlement().
         """
-        self.entries.clear()
-        self.order_id_to_client.clear()
+        with self._lock:
+            self.entries.clear()
+            self.order_id_to_client.clear()
+            self.entry_order_ids.clear()
+            self.stop_order_ids.clear()
+            self.stop_to_parent_entry_price.clear()

@@ -1,6 +1,7 @@
 """Application configuration loaded from environment / .env file."""
 
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 

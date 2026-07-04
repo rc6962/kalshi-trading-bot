@@ -27,7 +27,7 @@ class RiskGuard:
         if not cap or cap <= 0:
             return False
         if current_daily_pnl <= -cap:
-            logger.warning("Daily loss cap reached: %.2f / %.2f", current_daily_pnl, -cap)
+            logger.warning("Daily loss cap reached: pnl=%.2f, cap=-%.2f", current_daily_pnl, cap)
             return True
         return False
 

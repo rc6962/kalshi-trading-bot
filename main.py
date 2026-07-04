@@ -432,6 +432,9 @@ class WindowBot:
         now = datetime.now(timezone.utc)
         aligned = now.replace(second=0, microsecond=0)
         minutes_to_add = 15 - (now.minute % 15)
+        # If exactly on a boundary, use current window (not next)
+        if minutes_to_add == 15:
+            minutes_to_add = 0
         return aligned + timedelta(minutes=minutes_to_add)
 
     def _daily_realized_pnl(self) -> float:
@@ -465,6 +468,13 @@ class WindowBot:
             if event.get("fill_side") == "maker":
                 entry_fills.append(event)
 
+        # Build set of entry client_order_ids that were closed by stops
+        stopped_entry_ids: set[str] = set()
+        for stop_event in stop_fills:
+            parent_id = stop_event.get("parent_entry_client_order_id")
+            if parent_id:
+                stopped_entry_ids.add(parent_id)
+
         # Pre-bucket entry fills by ticker for O(1) lookup
         entries_by_ticker: dict[str, list[dict]] = defaultdict(list)
         for e in entry_fills:
@@ -480,10 +490,7 @@ class WindowBot:
             stop_price = float(stop_event["fill_price"])
             fill_count = float(stop_event["fill_count"])
             entry_price = float(stop_event.get("entry_price", "0.0"))
-            stop_ts = datetime.fromisoformat(stop_event["ts"])
 
-            # In stop_fill, we have entry_price directly from the stop_fill event
-            # We don't need to match to entry_fills because entry_price is already provided
             if entry_price > stop_price:
                 # Long YES: sold at stop_price after buying at entry_price
                 trade_pnl = (stop_price - entry_price) * fill_count
@@ -506,24 +513,16 @@ class WindowBot:
             if not candidates:
                 continue
 
-            # For each entry fill, if no stop_fill was received for the same entry (via entry_price),
-            # then it must have been closed by settlement
-            # We'll assume any entry fill that didn't get a stop_fill with matching entry_price is still open
-            # Since we don't have direct linkage, we'll assume all entries for this ticker that didn't
-            # trigger a stop_fill are closed by settlement
-            # This is imperfect but we have no order_id linkage
             for entry_event in candidates:
-                entry_price = float(entry_event["entry_price"])
-                fill_count = float(entry_event["fill_count"])
-                side = entry_event["side"]
+                # Skip entries that were already closed by stop-loss
+                entry_client_id = entry_event.get("client_order_id")
+                if entry_client_id and entry_client_id in stopped_entry_ids:
+                    continue
 
-                # Check if a stop_fill occurred for this entry (by matching entry_price and ticker)
-                # We'll assume if there's a stop_fill with same entry_price and ticker, it closed it
-                # But we don't have direct linkage, so we'll just assume if there's any stop_fill for this ticker,
-                # it closed all entries (this is conservative)
-                # Instead, we'll assume all entries for this ticker are closed by settlement if no stop_fill exists
-                # Since we don't know which one, we'll calculate PnL for all
-                # This is a known limitation
+                entry_price = float(entry_event.get("entry_price", "0.0"))
+                fill_count = float(entry_event.get("fill_count", "0"))
+                side = entry_event.get("side", "bid")
+
                 if side == "bid":  # long YES
                     trade_pnl = (settlement_price - entry_price) * fill_count
                 else:  # long NO (short YES)
@@ -558,7 +557,7 @@ def main() -> None:
 
     if args.yes is not None:
         yes_assets = [a.strip().upper() for a in args.yes.split(",") if a.strip()]
-        no_assets = [a.strip().upper() for a in args.no.split(",") if a.strip()]
+        no_assets = [a.strip().upper() for a in (args.no or "").split(",") if a.strip()]
         contracts = args.contracts or get_settings().default_contracts
         stop_width = Decimal(str(args.stop_width)) if args.stop_width else Decimal(str(get_settings().default_stop_width))
         if not args.live:

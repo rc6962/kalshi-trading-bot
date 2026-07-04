@@ -32,7 +32,6 @@ class KalshiWebSocket:
         self.connected = False
         self.subscribed_tickers: list[str] = []
         self.callbacks: dict[str, Callable[[dict[str, Any]], Coroutine[Any, Any, None] | None]] = {}
-        self._listen_task: asyncio.Task | None = None
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 10
 
@@ -180,10 +179,4 @@ class KalshiWebSocket:
             try:
                 await self.websocket.close()
             except Exception:
-                pass
-        if self._listen_task:
-            self._listen_task.cancel()
-            try:
-                await self._listen_task
-            except asyncio.CancelledError:
                 pass
