@@ -1,0 +1,21 @@
+# Commit Message Template
+# Format: [source/model] Subject
+# Example: [perplexity/gpt-4] Add trading logic
+
+[perplexity/MODEL] 
+
+# ----- REQUIRED INFO -----
+# Specify the LLM model used (gpt-4, claude-3, llama, etc):
+LLM-Model: 
+
+# Add Perplexity session ID or task reference if available:
+Perplexity-Session: 
+
+# ----- OPTIONAL -----
+# Add any relevant context:
+Context: 
+
+# ----- GUIDELINES -----
+# Keep subject line under 50 characters
+# Use imperative mood ("Add" not "Added")
+# Reference issues: Fixes #123, Related to #456
