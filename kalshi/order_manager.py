@@ -50,6 +50,9 @@ class OrderManager:
         self.entries: dict[str, EntryState] = {}  # client_order_id -> EntryState
         self.order_id_to_client: dict[str, str] = {}  # server order_id -> client_order_id
         self.settled_tickers: set[str] = set()
+        self.entry_order_ids: set[str] = set()  # track all entry order_ids
+        self.stop_order_ids: set[str] = set()   # track all stop order_ids
+        self.stop_to_parent_entry_price: dict[str, Decimal] = {}  # stop_order_id -> entry_price
         self.settings = get_settings()
 
     # ------------------------------------------------------------------
@@ -95,6 +98,7 @@ class OrderManager:
         self.entries[client_order_id] = entry
         if order_id:
             self.order_id_to_client[order_id] = client_order_id
+            self.entry_order_ids.add(order_id)
 
         self.trade_log.log_event(
             "entry_placed",
@@ -152,6 +156,7 @@ class OrderManager:
                 "total_filled": str(entry.filled_count),
                 "client_order_id": client_order_id,
                 "order_id": order_id,
+                "entry_price": str(entry.entry_price),
             },
         )
 
@@ -167,8 +172,14 @@ class OrderManager:
         fill_side: str = "taker",
     ) -> None:
         """Handle a stop fill event."""
-        # Stops are not tracked as separate state entries in this simplified design.
-        # We log the event and rely on settlement/positions for final state.
+        # Look up the parent entry price
+        entry_price = self.stop_to_parent_entry_price.get(order_id)
+        if entry_price is None:
+            logger.warning("Stop fill received but no parent entry price found for order_id=%s", order_id)
+            entry_price_str = "0.0000"
+        else:
+            entry_price_str = str(entry_price)
+
         self.trade_log.log_event(
             "stop_fill",
             {
@@ -177,9 +188,10 @@ class OrderManager:
                 "fill_side": fill_side,
                 "order_id": order_id,
                 "client_order_id": client_order_id,
+                "entry_price": entry_price_str,
             },
         )
-        logger.info("Stop filled: %s contracts @ %s (side=%s)", fill_count, fill_price, fill_side)
+        logger.info("Stop filled: %s contracts @ %s (side=%s, entry_price=%s)", fill_count, fill_price, fill_side, entry_price_str)
 
     # ------------------------------------------------------------------
     # Stop placement
@@ -211,6 +223,9 @@ class OrderManager:
         # Cancel any existing stop before placing a new one
         if entry.stop_order_id:
             self._cancel_order(entry.stop_order_id, entry.stop_client_order_id)
+            # Clean up old mappings
+            self.order_id_to_client.pop(entry.stop_order_id, None)
+            self.stop_order_ids.discard(entry.stop_order_id)
 
         side = self._stop_side(entry)
         price = self._stop_price(entry)
@@ -234,6 +249,10 @@ class OrderManager:
             entry.stop_client_order_id = client_order_id
             if entry.stop_order_id:
                 self.order_id_to_client[entry.stop_order_id] = client_order_id
+                self.stop_order_ids.add(entry.stop_order_id)
+
+            filled = Decimal(str(response.get("fill_count", "0")))
+            remaining = count - filled
 
             self.trade_log.log_event(
                 "stop_placed",
@@ -246,15 +265,68 @@ class OrderManager:
                     "client_order_id": client_order_id,
                     "order_id": entry.stop_order_id,
                     "type": "ioc_aggressive",
+                    "entry_price": str(entry.entry_price),
+                    "filled_count": str(filled),
+                    "remaining_count": str(remaining),
                 },
             )
             logger.info(
-                "Placed IoC stop %s %s @ %s (%s contracts)",
+                "Placed IoC stop %s %s @ %s (%s contracts, filled %s, remaining %s)",
                 entry.asset,
                 entry.ticker,
                 price,
                 count,
+                filled,
+                remaining,
             )
+            
+            # Track parent entry price for stop
+            if entry.stop_order_id:
+                self.stop_to_parent_entry_price[entry.stop_order_id] = entry.entry_price
+
+            if remaining > Decimal("0"):
+                logger.warning(
+                    "IOC stop left %s contracts unfilled for %s — escalating", 
+                    remaining, 
+                    entry.ticker
+                )
+                # Escalate: double the buffer and retry once
+                escalated_price = self._stop_price(entry) + (Decimal("0.05") if side == "bid" else -Decimal("0.05"))
+                escalated_payload = {
+                    "ticker": entry.ticker,
+                    "side": side,
+                    "count": _fmt_count(remaining),
+                    "price": _fmt_decimal(escalated_price),
+                    "time_in_force": "immediate_or_cancel",
+                    "self_trade_prevention_type": "taker_at_cross",
+                    "client_order_id": str(uuid.uuid4()),
+                    "reduce_only": True,
+                }
+                try:
+                    retry_response = self.rest.post("/portfolio/events/orders", json_data=escalated_payload)
+                    retry_filled = Decimal(str(retry_response.get("fill_count", "0")))
+                    retry_remaining = remaining - retry_filled
+                    if retry_remaining > Decimal("0"):
+                        logger.critical(
+                            "Escalated IOC stop still left %s contracts unfilled for %s — potential exposure", 
+                            retry_remaining, 
+                            entry.ticker
+                        )
+                        # Trigger risk guard emergency flag (to be implemented in risk_guard.py)
+                        # This requires a new method in RiskGuard
+                        self.trade_log.log_event(
+                            "emergency_exposure",
+                            {
+                                "asset": entry.asset,
+                                "ticker": entry.ticker,
+                                "unfilled_count": str(retry_remaining),
+                                "original_stop_price": str(price),
+                                "escalated_stop_price": str(escalated_price),
+                            }
+                        )
+                except Exception:
+                    logger.exception("Failed to place escalated IOC stop for %s", entry.asset)
+        
         except Exception:
             logger.exception("Failed to place IoC stop for %s", entry.asset)
 
@@ -300,6 +372,16 @@ class OrderManager:
         if order_id and order_id in self.order_id_to_client:
             return self.order_id_to_client[order_id]
         return None
+
+    def classify_order(self, order_id: str | None) -> str:
+        """Classify an order as 'entry', 'stop', or 'unknown'."""
+        if not order_id:
+            return "unknown"
+        if order_id in self.entry_order_ids:
+            return "entry"
+        if order_id in self.stop_order_ids:
+            return "stop"
+        return "unknown"
 
     def _cancel_order(self, order_id: str | None, client_order_id: str | None) -> None:
         if not order_id:
