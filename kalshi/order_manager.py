@@ -1,0 +1,326 @@
+"""Order placement, fill handling, and stop-loss management."""
+
+import logging
+import uuid
+from dataclasses import dataclass, field
+from decimal import Decimal
+from typing import Any
+
+from config.settings import get_settings
+from kalshi.rest_client import KalshiRestClient
+from storage.trade_log import TradeLog
+
+logger = logging.getLogger(__name__)
+
+
+def _fmt_decimal(value: Decimal | float | str, places: int = 4) -> str:
+    d = Decimal(str(value))
+    quantized = d.quantize(Decimal("0.01") if places <= 2 else Decimal("0.0001"))
+    return f"{quantized:.4f}"
+
+
+def _fmt_count(value: Decimal | float | str) -> str:
+    d = Decimal(str(value))
+    quantized = d.quantize(Decimal("0.01"))
+    return f"{quantized:.2f}"
+
+
+@dataclass
+class EntryState:
+    client_order_id: str
+    ticker: str
+    asset: str
+    side: str  # "bid" (buy YES) or "ask" (sell YES = long NO)
+    entry_price: Decimal
+    requested_count: Decimal
+    filled_count: Decimal = Decimal("0")
+    remaining_count: Decimal = Decimal("0")
+    stop_width: Decimal = Decimal("0.15")
+    order_id: str | None = None
+    stop_order_id: str | None = None
+    stop_client_order_id: str | None = None
+
+
+class OrderManager:
+    """Manages entries, fills, and IoC aggressive stop-losses."""
+
+    def __init__(self, rest: KalshiRestClient, trade_log: TradeLog | None = None):
+        self.rest = rest
+        self.trade_log = trade_log or TradeLog()
+        self.entries: dict[str, EntryState] = {}  # client_order_id -> EntryState
+        self.order_id_to_client: dict[str, str] = {}  # server order_id -> client_order_id
+        self.settled_tickers: set[str] = set()
+        self.settings = get_settings()
+
+    # ------------------------------------------------------------------
+    # Entry placement
+    # ------------------------------------------------------------------
+
+    def place_entry(
+        self,
+        ticker: str,
+        asset: str,
+        side: str,
+        price: Decimal,
+        count: Decimal,
+        stop_width: Decimal,
+    ) -> EntryState:
+        """Place a single entry order and return its state."""
+        client_order_id = str(uuid.uuid4())
+        payload = {
+            "ticker": ticker,
+            "side": side,
+            "count": _fmt_count(count),
+            "price": _fmt_decimal(price),
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
+            "client_order_id": client_order_id,
+            "post_only": True,
+        }
+
+        response = self.rest.post("/portfolio/events/orders", json_data=payload)
+        order_id = response.get("order_id")
+
+        entry = EntryState(
+            client_order_id=client_order_id,
+            ticker=ticker,
+            asset=asset,
+            side=side,
+            entry_price=price,
+            requested_count=count,
+            remaining_count=count,
+            stop_width=stop_width,
+            order_id=order_id,
+        )
+        self.entries[client_order_id] = entry
+        if order_id:
+            self.order_id_to_client[order_id] = client_order_id
+
+        self.trade_log.log_event(
+            "entry_placed",
+            {
+                "asset": asset,
+                "ticker": ticker,
+                "side": side,
+                "price": str(price),
+                "count": str(count),
+                "client_order_id": client_order_id,
+                "order_id": order_id,
+            },
+        )
+        logger.info(
+            "Placed entry %s %s %s @ %s (%s contracts)",
+            asset,
+            side,
+            ticker,
+            price,
+            count,
+        )
+        return entry
+
+    # ------------------------------------------------------------------
+    # Fill handling
+    # ------------------------------------------------------------------
+
+    def on_entry_fill(
+        self,
+        order_id: str | None,
+        client_order_id: str | None,
+        fill_price: str,
+        fill_count: str,
+        fill_side: str = "maker",
+    ) -> None:
+        """Handle an entry fill event. Place IoC stop for newly filled count."""
+        client_order_id = self._resolve_client_id(order_id, client_order_id)
+        if not client_order_id or client_order_id not in self.entries:
+            logger.warning("Fill for unknown entry order: order_id=%s client=%s", order_id, client_order_id)
+            return
+
+        entry = self.entries[client_order_id]
+        entry.filled_count += Decimal(fill_count)
+        entry.remaining_count = max(Decimal("0"), entry.requested_count - entry.filled_count)
+
+        self.trade_log.log_event(
+            "fill",
+            {
+                "asset": entry.asset,
+                "ticker": entry.ticker,
+                "side": entry.side,
+                "fill_price": fill_price,
+                "fill_count": fill_count,
+                "fill_side": fill_side,
+                "total_filled": str(entry.filled_count),
+                "client_order_id": client_order_id,
+                "order_id": order_id,
+            },
+        )
+
+        if entry.filled_count > Decimal("0"):
+            self._place_ioc_stop(entry)
+
+    def on_stop_fill(
+        self,
+        order_id: str | None,
+        client_order_id: str | None,
+        fill_price: str,
+        fill_count: str,
+        fill_side: str = "taker",
+    ) -> None:
+        """Handle a stop fill event."""
+        # Stops are not tracked as separate state entries in this simplified design.
+        # We log the event and rely on settlement/positions for final state.
+        self.trade_log.log_event(
+            "stop_fill",
+            {
+                "fill_price": fill_price,
+                "fill_count": fill_count,
+                "fill_side": fill_side,
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+            },
+        )
+        logger.info("Stop filled: %s contracts @ %s (side=%s)", fill_count, fill_price, fill_side)
+
+    # ------------------------------------------------------------------
+    # Stop placement
+    # ------------------------------------------------------------------
+
+    def _stop_side(self, entry: EntryState) -> str:
+        """Return the side needed to flatten the entry."""
+        return "ask" if entry.side == "bid" else "bid"
+
+    def _stop_price(self, entry: EntryState) -> Decimal:
+        """Compute aggressive IoC stop price.
+
+        For a long YES position, we need to sell YES below current market.
+        For a long NO position, we need to buy YES back above current market.
+        """
+        buffer = Decimal(str(self.settings.ioc_fallback_buffer))
+        if entry.side == "bid":
+            # Long YES: sell to flatten. Price = entry - stop_width - buffer.
+            return max(Decimal("0.01"), entry.entry_price - entry.stop_width - buffer)
+        else:
+            # Long NO: buy YES back. Price = entry + stop_width + buffer.
+            return min(Decimal("0.99"), entry.entry_price + entry.stop_width + buffer)
+
+    def _place_ioc_stop(self, entry: EntryState) -> None:
+        """Place (or replace) a single IoC reduce-only stop for current filled_count."""
+        if entry.filled_count <= Decimal("0"):
+            return
+
+        # Cancel any existing stop before placing a new one
+        if entry.stop_order_id:
+            self._cancel_order(entry.stop_order_id, entry.stop_client_order_id)
+
+        side = self._stop_side(entry)
+        price = self._stop_price(entry)
+        count = entry.filled_count
+        client_order_id = str(uuid.uuid4())
+
+        payload = {
+            "ticker": entry.ticker,
+            "side": side,
+            "count": _fmt_count(count),
+            "price": _fmt_decimal(price),
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
+            "client_order_id": client_order_id,
+            "reduce_only": True,
+        }
+
+        try:
+            response = self.rest.post("/portfolio/events/orders", json_data=payload)
+            entry.stop_order_id = response.get("order_id")
+            entry.stop_client_order_id = client_order_id
+            if entry.stop_order_id:
+                self.order_id_to_client[entry.stop_order_id] = client_order_id
+
+            self.trade_log.log_event(
+                "stop_placed",
+                {
+                    "asset": entry.asset,
+                    "ticker": entry.ticker,
+                    "side": side,
+                    "price": str(price),
+                    "count": str(count),
+                    "client_order_id": client_order_id,
+                    "order_id": entry.stop_order_id,
+                    "type": "ioc_aggressive",
+                },
+            )
+            logger.info(
+                "Placed IoC stop %s %s @ %s (%s contracts)",
+                entry.asset,
+                entry.ticker,
+                price,
+                count,
+            )
+        except Exception:
+            logger.exception("Failed to place IoC stop for %s", entry.asset)
+
+    # ------------------------------------------------------------------
+    # Settlement handling
+    # ------------------------------------------------------------------
+
+    def on_settlement(self, ticker: str, result: str, settlement_price: str | None) -> None:
+        """Mark a ticker as settled and clear its entry state."""
+        self.settled_tickers.add(ticker)
+        cleared = []
+        for client_order_id, entry in list(self.entries.items()):
+            if entry.ticker == ticker:
+                # Cancel any resting stop for this entry
+                if entry.stop_order_id:
+                    self._cancel_order(entry.stop_order_id, entry.stop_client_order_id)
+                cleared.append(client_order_id)
+
+        for client_order_id in cleared:
+            entry = self.entries.pop(client_order_id)
+            if entry.order_id:
+                self.order_id_to_client.pop(entry.order_id, None)
+            if entry.stop_order_id:
+                self.order_id_to_client.pop(entry.stop_order_id, None)
+
+        self.trade_log.log_event(
+            "settlement",
+            {
+                "ticker": ticker,
+                "result": result,
+                "settlement_price": settlement_price,
+            },
+        )
+        logger.info("Cleared state for settled ticker %s", ticker)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_client_id(self, order_id: str | None, client_order_id: str | None) -> str | None:
+        if client_order_id:
+            return client_order_id
+        if order_id and order_id in self.order_id_to_client:
+            return self.order_id_to_client[order_id]
+        return None
+
+    def _cancel_order(self, order_id: str | None, client_order_id: str | None) -> None:
+        if not order_id:
+            return
+        try:
+            self.rest.delete(f"/portfolio/events/orders/{order_id}")
+            logger.info("Canceled order %s (client=%s)", order_id, client_order_id)
+        except Exception:
+            logger.exception("Failed to cancel order %s", order_id)
+
+    def cancel_all_entries(self) -> None:
+        """Cancel all resting entry orders."""
+        for entry in list(self.entries.values()):
+            if entry.order_id and entry.remaining_count > Decimal("0"):
+                self._cancel_order(entry.order_id, entry.client_order_id)
+
+    def reset_window(self) -> None:
+        """Clear tracked entries for a new window.
+
+        Note: this should only be called after confirming no positions remain
+        for the previous window. State is normally cleared via on_settlement().
+        """
+        self.entries.clear()
+        self.order_id_to_client.clear()

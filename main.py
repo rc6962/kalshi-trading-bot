@@ -1,0 +1,510 @@
+"""Kalshi 15-Min Crypto Window Bot.
+
+Live-trading bot for Kalshi 15-minute crypto prediction markets.
+Places maker-limit entries at window open, dual stop-loss ladder on fill,
+and holds survivors to expiry.
+"""
+
+import argparse
+import asyncio
+import logging
+import random
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+from config.settings import get_settings
+from kalshi.market_discovery import ASSET_TO_SERIES, _market_close_time, discover_markets
+from kalshi.order_manager import OrderManager
+from kalshi.orderbook import OrderbookClient
+from kalshi.rest_client import KalshiRestClient
+from kalshi.risk_guard import RiskGuard, estimated_max_loss_for_window
+from kalshi.ws_client import KalshiWebSocket
+from storage.trade_log import TradeLog
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("bot.log"),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+ALL_ASSETS = list(ASSET_TO_SERIES.keys())
+
+
+@dataclass
+class BotConfig:
+    yes_assets: list[str]
+    no_assets: list[str]
+    contracts: int
+    stop_width: Decimal
+    daily_loss_cap: float
+    live_mode: bool
+
+
+def _multi_select(prompt: str, options: list[str], defaults: list[str] | None = None) -> list[str]:
+    print(f"\n{prompt}")
+    for i, opt in enumerate(options, 1):
+        marker = " [default]" if defaults and opt in defaults else ""
+        print(f"  {i}. {opt}{marker}")
+    print("Enter numbers separated by commas (e.g., 1,2), or 'all', or press Enter for defaults.")
+    raw = input("> ").strip()
+    if not raw:
+        return defaults or []
+    if raw.lower() == "all":
+        return list(options)
+    selected = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            idx = int(part) - 1
+            if 0 <= idx < len(options):
+                selected.append(options[idx])
+        except ValueError:
+            logger.warning("Ignoring invalid selection: %s", part)
+    return selected
+
+
+def _prompt_int(prompt: str, default: int) -> int:
+    raw = input(f"{prompt} [{default}]: ").strip()
+    return int(raw) if raw.isdigit() else default
+
+
+def _prompt_decimal(prompt: str, default: Decimal) -> Decimal:
+    raw = input(f"{prompt} [{default}]: ").strip()
+    return Decimal(raw) if raw else default
+
+
+def _prompt_float(prompt: str, default: float) -> float:
+    raw = input(f"{prompt} [{default}]: ").strip()
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        return default
+
+
+def interactive_startup() -> BotConfig:
+    """Run interactive command-line startup prompts."""
+    print("=" * 60)
+    print("Kalshi 15-Min Crypto Window Bot")
+    print("=" * 60)
+    print("WARNING: This bot trades real money if live mode is enabled.\n")
+
+    yes_assets = _multi_select(
+        "Select assets to BUY YES:",
+        ALL_ASSETS,
+        defaults=["BTC"],
+    )
+    no_assets = _multi_select(
+        "Select assets to BUY NO (sell YES):",
+        ALL_ASSETS,
+        defaults=["ETH"],
+    )
+
+    overlap = set(yes_assets) & set(no_assets)
+    if overlap:
+        print(f"\nWARNING: {overlap} selected for BOTH YES and NO. This flattens exposure on the same ticker.")
+        ok = input("Continue anyway? (yes/no): ").strip().lower()
+        if ok != "yes":
+            sys.exit(0)
+
+    settings = get_settings()
+    contracts = _prompt_int("Contracts per side, per asset", settings.default_contracts)
+    stop_width = _prompt_decimal("Stop-loss width in dollars", Decimal(str(settings.default_stop_width)))
+    daily_loss_cap = _prompt_float("Daily loss cap (0 to disable)", 0.0)
+
+    print("\nLive trading confirmation:")
+    print("Type YES exactly to connect to Kalshi PRODUCTION and trade real money.")
+    print("Anything else will exit.")
+    live = input("> ").strip()
+    live_mode = live == "YES"
+
+    if not live_mode:
+        print("Live mode not confirmed. Exiting.")
+        sys.exit(0)
+
+    config = BotConfig(
+        yes_assets=yes_assets,
+        no_assets=no_assets,
+        contracts=contracts,
+        stop_width=stop_width,
+        daily_loss_cap=daily_loss_cap,
+        live_mode=True,
+    )
+
+    print("\n" + "=" * 60)
+    print("CONFIGURATION SUMMARY")
+    print("=" * 60)
+    print(f"YES assets:      {yes_assets}")
+    print(f"NO assets:       {no_assets}")
+    print(f"Contracts:       {contracts}")
+    print(f"Stop width:      ${stop_width}")
+    print(f"Daily loss cap:  ${daily_loss_cap if daily_loss_cap > 0 else 'disabled'}")
+    print(f"Live mode:       {live_mode}")
+    print("=" * 60)
+
+    confirm = input("\nProceed? (yes/no): ").strip().lower()
+    if confirm != "yes":
+        print("Aborted.")
+        sys.exit(0)
+
+    return config
+
+
+class WindowBot:
+    """Core bot orchestrating windows, orders, and WebSocket events."""
+
+    def __init__(self, config: BotConfig):
+        self.config = config
+        self.settings = get_settings()
+        self.rest = KalshiRestClient()
+        self.ws = KalshiWebSocket()
+        self.trade_log = TradeLog()
+        self.order_manager = OrderManager(self.rest, self.trade_log)
+        self.risk_guard = RiskGuard(self.rest)
+        self.orderbook = OrderbookClient(self.rest)
+        self.current_markets: dict[str, dict[str, Any]] = {}
+        self.current_window_id: str = ""
+        self.current_window_close: datetime | None = None
+        self._shutdown = False
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    async def run(self) -> None:
+        """Run the bot until shutdown."""
+        self.trade_log.log_event("startup", {"config": self.config.__dict__})
+
+        # Start WebSocket listener in background
+        ws_task = asyncio.create_task(self.ws.listen())
+        # Give WS a moment to connect
+        await asyncio.sleep(2)
+
+        # Register callbacks
+        self.ws.register_callback("fill", self._on_fill)
+        self.ws.register_callback("settled", self._on_settled)
+        self.ws.register_callback("determined", self._on_determined)
+
+        try:
+            while not self._shutdown:
+                if self.risk_guard.kill_switch_active():
+                    logger.warning("Kill switch active. Halting new entries.")
+                    await asyncio.sleep(5)
+                    continue
+
+                if self.risk_guard.check_daily_loss(self._daily_realized_pnl(), self.config.daily_loss_cap):
+                    logger.warning("Daily loss cap reached. Halting new entries.")
+                    await asyncio.sleep(60)
+                    continue
+
+                if not self.ws.connected:
+                    logger.warning("WebSocket not connected. Waiting...")
+                    await asyncio.sleep(5)
+                    continue
+
+                next_open = self._next_window_open()
+                wait_seconds = (next_open - datetime.now(timezone.utc)).total_seconds()
+                # Wake up 10 seconds before the expected open so we can catch the exact listing
+                pre_open_buffer = 10
+                sleep_seconds = max(0, wait_seconds - pre_open_buffer)
+                if sleep_seconds > 0:
+                    logger.info("Next window expected at %s (sleeping %.0fs)", next_open.isoformat(), sleep_seconds)
+                    await asyncio.sleep(sleep_seconds)
+
+                await self._execute_window()
+        except asyncio.CancelledError:
+            logger.info("Bot loop cancelled")
+        finally:
+            await self._shutdown_bot(ws_task)
+
+    async def _execute_window(self) -> None:
+        """Run one trading window."""
+        now = datetime.now(timezone.utc)
+        self.current_window_id = now.strftime("%Y%m%d%H%M")
+        logger.info("=== Starting window %s ===", self.current_window_id)
+
+        all_assets = list(set(self.config.yes_assets + self.config.no_assets))
+
+        # Poll until Kalshi actually lists the active markets, up to 60 seconds
+        self.current_markets = await self._wait_for_active_markets(all_assets, timeout_seconds=60)
+        if not self.current_markets:
+            logger.warning("No active markets found for window %s after polling", self.current_window_id)
+            return
+
+        # Record the actual window close time from the market metadata
+        close_times = [
+            _market_close_time(m)
+            for m in self.current_markets.values()
+            if _market_close_time(m)
+        ]
+        if close_times:
+            self.current_window_close = min(close_times)
+            logger.info("Window close time set to %s", self.current_window_close.isoformat())
+
+        # Tiny randomized wait so the book has a moment to form
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+
+        # Fetch orderbooks and build entry plan
+        planned_entries = []
+        for asset in self.config.yes_assets:
+            market = self.current_markets.get(asset.upper())
+            if not market:
+                continue
+            try:
+                book = await asyncio.to_thread(
+                    self.orderbook.get_maker_prices,
+                    market["ticker"],
+                    self.settings.entry_improvement,
+                )
+                planned_entries.append({
+                    "asset": asset.upper(),
+                    "ticker": market["ticker"],
+                    "side": "bid",
+                    "price": book["yes_bid_maker"],
+                    "count": Decimal(self.config.contracts),
+                })
+            except Exception:
+                logger.exception("Failed to get orderbook for %s", asset)
+
+        for asset in self.config.no_assets:
+            market = self.current_markets.get(asset.upper())
+            if not market:
+                continue
+            try:
+                book = await asyncio.to_thread(
+                    self.orderbook.get_maker_prices,
+                    market["ticker"],
+                    self.settings.entry_improvement,
+                )
+                planned_entries.append({
+                    "asset": asset.upper(),
+                    "ticker": market["ticker"],
+                    "side": "ask",
+                    "price": book["yes_ask_maker"],
+                    "count": Decimal(self.config.contracts),
+                })
+            except Exception:
+                logger.exception("Failed to get orderbook for %s", asset)
+
+        if not planned_entries:
+            logger.warning("No planned entries for window %s", self.current_window_id)
+            return
+
+        # Risk checks
+        max_loss = estimated_max_loss_for_window(planned_entries)
+        if not self.risk_guard.check_balance(max_loss):
+            logger.warning("Insufficient balance for estimated max loss %.2f", max_loss)
+            return
+
+        if not self.risk_guard.check_exchange_status():
+            logger.warning("Exchange not active; skipping window")
+            return
+
+        # Re-subscribe WS to current tickers
+        tickers = [e["ticker"] for e in planned_entries]
+        try:
+            await self.ws.subscribe(tickers)
+        except Exception:
+            logger.exception("Failed to subscribe to tickers")
+
+        # Place entries
+        for plan in planned_entries:
+            try:
+                self.order_manager.place_entry(
+                    ticker=plan["ticker"],
+                    asset=plan["asset"],
+                    side=plan["side"],
+                    price=plan["price"],
+                    count=plan["count"],
+                    stop_width=self.config.stop_width,
+                )
+            except Exception:
+                logger.exception("Failed to place entry for %s", plan["asset"])
+
+        # Wait until ~3 minutes before this window's actual close, then cancel unfilled entries
+        if self.current_window_close:
+            seconds_to_close = (self.current_window_close - datetime.now(timezone.utc)).total_seconds()
+        else:
+            seconds_to_close = 15 * 60  # fallback
+        cancel_seconds_before = 180
+        wait_until_cancel = max(0, seconds_to_close - cancel_seconds_before)
+        logger.info("Waiting %.0fs before canceling unfilled entries", wait_until_cancel)
+        await asyncio.sleep(wait_until_cancel)
+
+        self.order_manager.cancel_all_entries()
+        logger.info("Canceled unfilled entry orders")
+
+        # Hold remaining positions to expiry; state is cleared on settlement events
+        logger.info("=== Window %s entry phase complete ===", self.current_window_id)
+
+    # ------------------------------------------------------------------
+    # WebSocket callbacks
+    # ------------------------------------------------------------------
+
+    async def _on_fill(self, data: dict[str, Any]) -> None:
+        """Handle fill WebSocket messages."""
+        msg = data.get("msg", data)
+        order_id = msg.get("order_id")
+        client_order_id = msg.get("client_order_id")
+        fill_price = msg.get("price_dollars") or msg.get("fill_price_dollars")
+        fill_count = msg.get("count_fp") or msg.get("fill_count")
+
+        if not fill_price or not fill_count:
+            logger.debug("Fill message missing price/count: %s", data)
+            return
+
+        resolved_client_id = self.order_manager._resolve_client_id(order_id, client_order_id)
+        if not resolved_client_id:
+            return
+
+        # Entries are maker; stops are taker. Infer from our own order state.
+        if resolved_client_id in self.order_manager.entries:
+            await asyncio.to_thread(
+                self.order_manager.on_entry_fill,
+                order_id,
+                resolved_client_id,
+                str(fill_price),
+                str(fill_count),
+                "maker",
+            )
+        else:
+            # Stop fills are not tracked as separate state entries in the simplified model.
+            await asyncio.to_thread(
+                self.order_manager.on_stop_fill,
+                order_id,
+                resolved_client_id,
+                str(fill_price),
+                str(fill_count),
+                "taker",
+            )
+
+    async def _on_settled(self, data: dict[str, Any]) -> None:
+        """Handle market settlement events."""
+        msg = data.get("msg", data)
+        ticker = msg.get("market_ticker") or msg.get("ticker")
+        result = msg.get("result")
+        settlement_price = msg.get("settlement_price_dollars")
+        logger.info("Settlement: %s -> %s @ %s", ticker, result, settlement_price)
+        await asyncio.to_thread(
+            self.order_manager.on_settlement,
+            ticker,
+            result,
+            settlement_price,
+        )
+
+    async def _on_determined(self, data: dict[str, Any]) -> None:
+        """Handle market determination events."""
+        msg = data.get("msg", data)
+        ticker = msg.get("market_ticker") or msg.get("ticker")
+        result = msg.get("result")
+        logger.info("Determined: %s -> %s", ticker, result)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _wait_for_active_markets(
+        self,
+        assets: list[str],
+        timeout_seconds: float = 60,
+        poll_interval: float = 2.0,
+    ) -> dict[str, dict[str, Any]]:
+        """Poll Kalshi until active markets are listed, then return them."""
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
+        while datetime.now(timezone.utc) < deadline:
+            try:
+                markets = await asyncio.to_thread(discover_markets, self.rest, assets)
+                if markets:
+                    return markets
+            except Exception:
+                logger.exception("Market discovery poll failed")
+            await asyncio.sleep(poll_interval)
+        return {}
+
+    def _next_window_open(self) -> datetime:
+        """Return the next 15-minute boundary (:00, :15, :30, :45)."""
+        now = datetime.now(timezone.utc)
+        minute = (now.minute // 15 + 1) * 15
+        next_time = now.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=minute)
+        if next_time <= now:
+            next_time += timedelta(hours=1)
+        return next_time
+
+    def _daily_realized_pnl(self) -> float:
+        """Rough realized PnL from stop fills today."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        pnl = 0.0
+        for event in self.trade_log.read_events("stop_fill"):
+            if event.get("ts", "").startswith(today):
+                # Approximate loss: side determines sign
+                side = event.get("side", "")
+                fill_price = float(event.get("fill_price", 0))
+                fill_count = float(event.get("fill_count", 0))
+                # For stops, a fill means we exited. Loss magnitude depends on entry.
+                # Without entry price in event, use stop width as rough estimate.
+                if side:
+                    pnl -= self.config.stop_width * fill_count
+        return pnl
+
+    async def _shutdown_bot(self, ws_task: asyncio.Task) -> None:
+        """Graceful shutdown."""
+        logger.info("Shutting down bot...")
+        self._shutdown = True
+        self.order_manager.cancel_all_entries()
+        await self.ws.close()
+        ws_task.cancel()
+        try:
+            await ws_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Shutdown complete")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Kalshi 15-Min Crypto Window Bot")
+    parser.add_argument("--yes", help="Comma-separated YES assets (overrides prompt)")
+    parser.add_argument("--no", help="Comma-separated NO assets (overrides prompt)")
+    parser.add_argument("--contracts", type=int, help="Contracts per side")
+    parser.add_argument("--stop-width", type=float, help="Stop width in dollars")
+    parser.add_argument("--daily-loss-cap", type=float, default=0.0, help="Daily loss cap")
+    parser.add_argument("--live", action="store_true", help="Skip live confirmation prompt")
+    args = parser.parse_args()
+
+    if args.yes is not None:
+        yes_assets = [a.strip().upper() for a in args.yes.split(",") if a.strip()]
+        no_assets = [a.strip().upper() for a in args.no.split(",") if a.strip()]
+        contracts = args.contracts or get_settings().default_contracts
+        stop_width = Decimal(str(args.stop_width)) if args.stop_width else Decimal(str(get_settings().default_stop_width))
+        if not args.live:
+            print("--live flag required when using CLI args")
+            sys.exit(1)
+        config = BotConfig(
+            yes_assets=yes_assets,
+            no_assets=no_assets,
+            contracts=contracts,
+            stop_width=stop_width,
+            daily_loss_cap=args.daily_loss_cap,
+            live_mode=True,
+        )
+    else:
+        config = interactive_startup()
+
+    bot = WindowBot(config)
+
+    try:
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+
+
+if __name__ == "__main__":
+    main()
