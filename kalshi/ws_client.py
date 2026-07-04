@@ -34,6 +34,7 @@ class KalshiWebSocket:
         self.callbacks: dict[str, Callable[[dict[str, Any]], Coroutine[Any, Any, None] | None]] = {}
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 10
+        self._listen_task: asyncio.Task | None = None
 
     def _handshake_headers(self) -> dict[str, str]:
         timestamp = str(int(time.time() * 1000))
@@ -109,6 +110,7 @@ class KalshiWebSocket:
 
     async def listen(self) -> None:
         """Main listen loop with reconnect."""
+        self._listen_task = asyncio.current_task()
         while True:
             try:
                 await self.connect()

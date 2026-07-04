@@ -389,14 +389,14 @@ class OrderManager:
 
     def on_settlement(self, ticker: str, result: str, settlement_price: str | None) -> None:
         """Mark a ticker as settled and clear its entry state."""
+        to_cancel = []
         with self._lock:
             self.settled_tickers.add(ticker)
             cleared = []
             for client_order_id, entry in list(self.entries.items()):
                 if entry.ticker == ticker:
-                    # Cancel any resting stop for this entry
                     if entry.stop_order_id:
-                        self._cancel_order(entry.stop_order_id, entry.stop_client_order_id)
+                        to_cancel.append((entry.stop_order_id, entry.stop_client_order_id))
                     cleared.append(client_order_id)
 
             for client_order_id in cleared:
@@ -405,6 +405,10 @@ class OrderManager:
                     self.order_id_to_client.pop(entry.order_id, None)
                 if entry.stop_order_id:
                     self.order_id_to_client.pop(entry.stop_order_id, None)
+
+        # Cancel orders outside the lock to avoid blocking during network calls
+        for order_id, coid in to_cancel:
+            self._cancel_order(order_id, coid)
 
         self.trade_log.log_event(
             "settlement",
@@ -423,8 +427,9 @@ class OrderManager:
     def _resolve_client_id(self, order_id: str | None, client_order_id: str | None) -> str | None:
         if client_order_id:
             return client_order_id
-        if order_id and order_id in self.order_id_to_client:
-            return self.order_id_to_client[order_id]
+        if order_id:
+            with self._lock:
+                return self.order_id_to_client.get(order_id)
         return None
 
     def classify_order(self, order_id: str | None) -> str:
@@ -448,10 +453,15 @@ class OrderManager:
 
     def cancel_all_entries(self) -> None:
         """Cancel all resting entry orders."""
+        to_cancel = []
         with self._lock:
             for entry in list(self.entries.values()):
                 if entry.order_id and entry.remaining_count > Decimal("0"):
-                    self._cancel_order(entry.order_id, entry.client_order_id)
+                    to_cancel.append((entry.order_id, entry.client_order_id))
+
+        # Cancel orders outside the lock to avoid blocking during network calls
+        for order_id, coid in to_cancel:
+            self._cancel_order(order_id, coid)
 
     def reset_window(self) -> None:
         """Clear tracked entries for a new window.

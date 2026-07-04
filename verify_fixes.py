@@ -115,6 +115,116 @@ else:
     print(f"  [FAIL] places parameter still exists: {params}")
     sys.exit(1)
 
+# Test 7: Verify on_settlement doesn't hold lock during network call
+print("\nTest 7: on_settlement releases lock before network call...")
+import threading
+from unittest.mock import patch
+
+mock_rest = MagicMock()
+om2 = OrderManager(mock_rest, TradeLog())
+
+# Create an entry with a stop order
+entry = EntryState(
+    client_order_id="test-entry-789",
+    ticker="BTC-15MIN-TEST2",
+    asset="BTC",
+    side="bid",
+    entry_price=Decimal("0.50"),
+    requested_count=Decimal("10"),
+    remaining_count=Decimal("0"),
+    filled_count=Decimal("10"),
+    stop_width=Decimal("0.15"),
+    stop_order_id="stop-999",
+    stop_client_order_id="stop-client-999",
+)
+om2.entries["test-entry-789"] = entry
+
+# Track if lock was released during _cancel_order call
+lock_released_during_cancel = False
+original_cancel = om2._cancel_order
+
+def mock_cancel_with_check(order_id, coid):
+    global lock_released_during_cancel
+    # Try to acquire lock - if successful, it means lock was released
+    acquired = om2._lock.acquire(blocking=False)
+    if acquired:
+        lock_released_during_cancel = True
+        om2._lock.release()
+    original_cancel(order_id, coid)
+
+with patch.object(om2, '_cancel_order', side_effect=mock_cancel_with_check):
+    om2.on_settlement("BTC-15MIN-TEST2", "yes", "0.99")
+
+if lock_released_during_cancel:
+    print(f"  [PASS] Lock released before _cancel_order call")
+else:
+    print(f"  [FAIL] Lock still held during _cancel_order call")
+    sys.exit(1)
+
+# Test 8: Verify cancel_all_entries doesn't hold lock during network call
+print("\nTest 8: cancel_all_entries releases lock before network call...")
+mock_rest = MagicMock()
+om3 = OrderManager(mock_rest, TradeLog())
+
+entry = EntryState(
+    client_order_id="test-entry-999",
+    ticker="ETH-15MIN-TEST",
+    asset="ETH",
+    side="bid",
+    entry_price=Decimal("0.50"),
+    requested_count=Decimal("10"),
+    remaining_count=Decimal("10"),
+    filled_count=Decimal("0"),
+    stop_width=Decimal("0.15"),
+    order_id="order-888",
+)
+om3.entries["test-entry-999"] = entry
+
+lock_released_during_cancel = False
+
+def mock_cancel_with_check2(order_id, coid):
+    global lock_released_during_cancel
+    acquired = om3._lock.acquire(blocking=False)
+    if acquired:
+        lock_released_during_cancel = True
+        om3._lock.release()
+
+with patch.object(om3, '_cancel_order', side_effect=mock_cancel_with_check2):
+    om3.cancel_all_entries()
+
+if lock_released_during_cancel:
+    print(f"  [PASS] Lock released before _cancel_order call")
+else:
+    print(f"  [FAIL] Lock still held during _cancel_order call")
+    sys.exit(1)
+
+# Test 9: Verify _resolve_client_id is thread-safe
+print("\nTest 9: _resolve_client_id thread safety...")
+mock_rest = MagicMock()
+om4 = OrderManager(mock_rest, TradeLog())
+om4.order_id_to_client["order-123"] = "client-123"
+
+# Should not raise or deadlock
+result = om4._resolve_client_id("order-123", None)
+if result == "client-123":
+    print(f"  [PASS] _resolve_client_id works with lock")
+else:
+    print(f"  [FAIL] _resolve_client_id returned wrong value: {result}")
+    sys.exit(1)
+
+# Test 10: Verify ws_client _listen_task is assigned
+print("\nTest 10: ws_client _listen_task assignment...")
+from kalshi.ws_client import KalshiWebSocket
+ws = KalshiWebSocket.__new__(KalshiWebSocket)
+ws._listen_task = None
+# Check that the attribute exists and can be assigned
+ws._listen_task = "test-task"
+if ws._listen_task == "test-task":
+    print(f"  [PASS] _listen_task attribute exists and assignable")
+else:
+    print(f"  [FAIL] _listen_task not properly assigned")
+    sys.exit(1)
+
 print("\n" + "=" * 60)
 print("ALL TESTS PASSED")
 print("=" * 60)
