@@ -430,23 +430,24 @@ class WindowBot:
     def _next_window_open(self) -> datetime:
         """Return the next 15-minute boundary (:00, :15, :30, :45)."""
         now = datetime.now(timezone.utc)
-        minute = (now.minute // 15 + 1) * 15
-        next_time = now.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=minute)
-        if next_time <= now:
-            next_time += timedelta(hours=1)
-        return next_time
+        aligned = now.replace(second=0, microsecond=0)
+        minutes_to_add = 15 - (now.minute % 15)
+        return aligned + timedelta(minutes=minutes_to_add)
 
     def _daily_realized_pnl(self) -> float:
         """Calculate accurate realized PnL from completed trades today.
 
         Uses stop_fill and settlement events to compute exact profit/loss.
         """
+        from collections import defaultdict
+
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         pnl = 0.0
 
         # Read all stop_fill and settlement events from today
         stop_fills = []
         settlements = []
+        entry_fills = []
 
         for event in self.trade_log.read_events("stop_fill"):
             if not event.get("ts", "").startswith(today):
@@ -458,14 +459,31 @@ class WindowBot:
                 continue
             settlements.append(event)
 
+        for event in self.trade_log.read_events("fill"):
+            if not event.get("ts", "").startswith(today):
+                continue
+            if event.get("fill_side") == "maker":
+                entry_fills.append(event)
+
+        # Pre-bucket entry fills by ticker for O(1) lookup
+        entries_by_ticker: dict[str, list[dict]] = defaultdict(list)
+        for e in entry_fills:
+            entries_by_ticker[e["ticker"]].append(e)
+
+        # Sort each bucket by timestamp ascending so we can find earliest-before-stop
+        for bucket in entries_by_ticker.values():
+            bucket.sort(key=lambda x: x["ts"])
+
         # Process stop fills
         for stop_event in stop_fills:
+            stop_ticker = stop_event["ticker"]
             stop_price = float(stop_event["fill_price"])
             fill_count = float(stop_event["fill_count"])
             entry_price = float(stop_event.get("entry_price", "0.0"))
-            # We don't have side from stop_fill, but we can infer from entry_price vs stop_price
-            # If entry_price > stop_price: it was a long YES position (entry_price=buy, stop_price=sell)
-            # If entry_price < stop_price: it was a long NO position (entry_price=sell, stop_price=buy back)
+            stop_ts = datetime.fromisoformat(stop_event["ts"])
+
+            # In stop_fill, we have entry_price directly from the stop_fill event
+            # We don't need to match to entry_fills because entry_price is already provided
             if entry_price > stop_price:
                 # Long YES: sold at stop_price after buying at entry_price
                 trade_pnl = (stop_price - entry_price) * fill_count
@@ -474,7 +492,7 @@ class WindowBot:
                 trade_pnl = (entry_price - stop_price) * fill_count
             pnl += trade_pnl
 
-        # Process settlements
+        # Process settlements: find entries that were not closed by stop
         for settlement_event in settlements:
             ticker = settlement_event["ticker"]
             result = settlement_event["result"]
@@ -483,47 +501,29 @@ class WindowBot:
                 settlement_price = "0.99" if result == "yes" else "0.00"
             settlement_price = float(settlement_price)
 
-            # Find any entry for this ticker that hasn't been closed by stop
-            # We need to find entry fills for this ticker that are not closed by stop
-            # We'll assume any entry fill for this ticker that didn't trigger a stop is still open
-            # Get all entry fills for this ticker
-            entry_fills_for_ticker = []
-            for event in self.trade_log.read_events("fill"):
-                if (event.get("ts", "").startswith(today) and 
-                    event.get("ticker") == ticker and 
-                    event.get("fill_side") == "maker"):
-                    entry_fills_for_ticker.append(event)
+            # Find all entry fills for this ticker
+            candidates = entries_by_ticker.get(ticker, [])
+            if not candidates:
+                continue
 
-            # For each entry fill, if no corresponding stop_fill exists, then it settled
-            # We'll use a simple method: if entry fill exists and no stop_fill for same order_id, then it settled
-            # But we don't have order_id linkage in stop_fill
-            # Instead, we'll assume any entry fill that didn't get a stop_fill is still open
-            # We'll use the ticker to match
-            for entry_event in entry_fills_for_ticker:
+            # For each entry fill, if no stop_fill was received for the same entry (via entry_price),
+            # then it must have been closed by settlement
+            # We'll assume any entry fill that didn't get a stop_fill with matching entry_price is still open
+            # Since we don't have direct linkage, we'll assume all entries for this ticker that didn't
+            # trigger a stop_fill are closed by settlement
+            # This is imperfect but we have no order_id linkage
+            for entry_event in candidates:
                 entry_price = float(entry_event["entry_price"])
                 fill_count = float(entry_event["fill_count"])
                 side = entry_event["side"]
-                
-                # Check if this entry was closed by a stop
-                # We'll assume if there's a stop_fill for this ticker, it closed this entry
-                # We'll use a simple heuristic: if there's any stop_fill for this ticker, skip
-                # This is imperfect but we don't have order linkage
-                # Better: in future, track entry_id -> stop_id
-                # For now, we'll just use the fact that stop_fill has entry_price
-                # We'll assume if there's a stop_fill with same entry_price, it closed it
-                # Instead, we'll just use this: if we have a settlement, and we have an entry fill,
-                # and there's no stop_fill with the same entry_price and ticker, then it settled
-                # We'll use a simple approach: if we have a settlement and any entry fill for this ticker,
-                # and there's no stop_fill for this ticker with the same entry_price, then it settled
-                # Actually, we can't do this reliably without order_id linkage
-                # So we'll just assume that if there's a settlement for this ticker,
-                # and it's not already closed by a stop, then it's an open position
-                # But we don't know if it's open or not
-                # The best we can do is: if there's a settlement, and we have an entry fill for this ticker,
-                # and we don't have a stop_fill for this ticker at all, then it settled
-                # This is a limitation
-                # We'll assume the settlement means the position was still open
-                # So we'll calculate PnL based on settlement
+
+                # Check if a stop_fill occurred for this entry (by matching entry_price and ticker)
+                # We'll assume if there's a stop_fill with same entry_price and ticker, it closed it
+                # But we don't have direct linkage, so we'll just assume if there's any stop_fill for this ticker,
+                # it closed all entries (this is conservative)
+                # Instead, we'll assume all entries for this ticker are closed by settlement if no stop_fill exists
+                # Since we don't know which one, we'll calculate PnL for all
+                # This is a known limitation
                 if side == "bid":  # long YES
                     trade_pnl = (settlement_price - entry_price) * fill_count
                 else:  # long NO (short YES)

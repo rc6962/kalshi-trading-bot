@@ -172,6 +172,19 @@ class OrderManager:
         fill_side: str = "taker",
     ) -> None:
         """Handle a stop fill event."""
+        # Try to resolve associated entry for richer logging
+        asset = "unknown"
+        ticker = "unknown"
+        side = "unknown"
+        
+        # The stop's client_order_id maps back to the entry via stop_client_order_id
+        for entry in self.entries.values():
+            if entry.stop_client_order_id == client_order_id:
+                asset = entry.asset
+                ticker = entry.ticker
+                side = entry.side
+                break
+
         # Look up the parent entry price
         entry_price = self.stop_to_parent_entry_price.get(order_id)
         if entry_price is None:
@@ -183,15 +196,17 @@ class OrderManager:
         self.trade_log.log_event(
             "stop_fill",
             {
+                "asset": asset,
+                "ticker": ticker,
+                "side": side,
                 "fill_price": fill_price,
                 "fill_count": fill_count,
                 "fill_side": fill_side,
                 "order_id": order_id,
                 "client_order_id": client_order_id,
-                "entry_price": entry_price_str,
             },
         )
-        logger.info("Stop filled: %s contracts @ %s (side=%s, entry_price=%s)", fill_count, fill_price, fill_side, entry_price_str)
+        logger.info("Stop filled: %s %s %s contracts @ %s (side=%s)", asset, ticker, fill_count, fill_price, fill_side)
 
     # ------------------------------------------------------------------
     # Stop placement
@@ -247,6 +262,22 @@ class OrderManager:
             response = self.rest.post("/portfolio/events/orders", json_data=payload)
             entry.stop_order_id = response.get("order_id")
             entry.stop_client_order_id = client_order_id
+            status = response.get("status", "")
+            
+            if not entry.stop_order_id or status in ("canceled", "rejected"):
+                logger.critical(
+                    "IoC stop FAILED for %s %s — position unprotected! "
+                    "Manual intervention required. Entry price: %s, Stop price attempted: %s",
+                    entry.asset,
+                    entry.ticker,
+                    entry.entry_price,
+                    price
+                )
+                # Cancel the entry order to prevent further exposure
+                self._emergency_cancel_entry(entry)
+                entry.stop_order_id = None  # Prevent retry attempts
+                return
+
             if entry.stop_order_id:
                 self.order_id_to_client[entry.stop_order_id] = client_order_id
                 self.stop_order_ids.add(entry.stop_order_id)
@@ -279,15 +310,15 @@ class OrderManager:
                 filled,
                 remaining,
             )
-            
+
             # Track parent entry price for stop
             if entry.stop_order_id:
                 self.stop_to_parent_entry_price[entry.stop_order_id] = entry.entry_price
 
             if remaining > Decimal("0"):
                 logger.warning(
-                    "IOC stop left %s contracts unfilled for %s — escalating", 
-                    remaining, 
+                    "IOC stop left %s contracts unfilled for %s — escalating",
+                    remaining,
                     entry.ticker
                 )
                 # Escalate: double the buffer and retry once
@@ -308,8 +339,8 @@ class OrderManager:
                     retry_remaining = remaining - retry_filled
                     if retry_remaining > Decimal("0"):
                         logger.critical(
-                            "Escalated IOC stop still left %s contracts unfilled for %s — potential exposure", 
-                            retry_remaining, 
+                            "Escalated IOC stop still left %s contracts unfilled for %s — potential exposure",
+                            retry_remaining,
                             entry.ticker
                         )
                         # Trigger risk guard emergency flag (to be implemented in risk_guard.py)
@@ -326,9 +357,15 @@ class OrderManager:
                         )
                 except Exception:
                     logger.exception("Failed to place escalated IOC stop for %s", entry.asset)
-        
+
         except Exception:
             logger.exception("Failed to place IoC stop for %s", entry.asset)
+
+    def _emergency_cancel_entry(self, entry: EntryState) -> None:
+        """Cancel the entry order if IoC stop fails, to limit further fill exposure."""
+        if entry.order_id and entry.remaining_count > Decimal("0"):
+            logger.warning("Emergency canceling entry %s to prevent further fills", entry.asset)
+            self._cancel_order(entry.order_id, entry.client_order_id)
 
     # ------------------------------------------------------------------
     # Settlement handling

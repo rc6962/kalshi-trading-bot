@@ -64,10 +64,34 @@ class KalshiWebSocket:
             logger.exception("WebSocket connection failed")
             raise
 
+    async def unsubscribe(self, market_tickers: list[str], channels: list[str] | None = None) -> None:
+        """Unsubscribe from channels for given market tickers."""
+        if not self.websocket or not self.connected:
+            return
+
+        channels = channels or DEFAULT_CHANNELS
+        unsub_msg = {
+            "id": int(time.time() * 1000),
+            "cmd": "unsubscribe",
+            "params": {
+                "channels": channels,
+                "market_tickers": market_tickers,
+            },
+        }
+        try:
+            await self.websocket.send(json.dumps(unsub_msg))
+            logger.info("Unsubscribed from %d tickers", len(market_tickers))
+        except Exception:
+            logger.exception("Failed to send unsubscribe message")
+
     async def subscribe(self, market_tickers: list[str], channels: list[str] | None = None) -> None:
         """Subscribe to channels for given market tickers."""
         if not self.websocket or not self.connected:
             raise RuntimeError("WebSocket not connected")
+
+        # Unsubscribe from previous tickers before subscribing to new ones
+        if self.subscribed_tickers:
+            await self.unsubscribe(self.subscribed_tickers, channels)
 
         self.subscribed_tickers = list(market_tickers)
         channels = channels or DEFAULT_CHANNELS

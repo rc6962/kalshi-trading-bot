@@ -57,6 +57,7 @@ class Settings(BaseSettings):
         return value.strip()
 
 
+@lru_cache(maxsize=None)
 def get_settings() -> Settings:
-    """Factory returning validated settings."""
+    """Factory returning a cached, validated settings singleton."""
     return Settings()
