@@ -797,6 +797,40 @@ class OrderManager:
             )
             self._cancel_order(entry.order_id, entry.client_order_id)
 
+    def reconcile_positions(self) -> None:
+        """Fetch live positions from Kalshi and warn if they don't match our
+        internal OrderManager state.  Trusts Kalshi as source of truth."""
+        try:
+            data = self.rest.get_positions()
+        except Exception:
+            return  # will retry on next loop
+
+        kalshi_positions: dict[str, Decimal] = {}
+        for pos in data.get("positions", []):
+            ticker = pos.get("ticker")
+            position = pos.get("position", "0")
+            if ticker and Decimal(position) != Decimal("0"):
+                kalshi_positions[ticker] = Decimal(position)
+
+        # Build expected position per ticker from our entries
+        expected: dict[str, Decimal] = {}
+        with self._lock:
+            for entry in self.entries.values():
+                if entry.filled_count <= Decimal("0"):
+                    continue
+                net = entry.filled_count if entry.side == "bid" else -entry.filled_count
+                expected[entry.ticker] = expected.get(entry.ticker, Decimal("0")) + net
+
+        for ticker, exp in expected.items():
+            actual = kalshi_positions.get(ticker, Decimal("0"))
+            if actual != exp:
+                logger.warning(
+                    "Position mismatch for %s: Kalshi=%s, bot=%s",
+                    ticker,
+                    actual,
+                    exp,
+                )
+
     # ------------------------------------------------------------------
     # Settlement handling
     # ------------------------------------------------------------------

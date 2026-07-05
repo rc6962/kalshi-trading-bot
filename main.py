@@ -525,6 +525,10 @@ class WindowBot:
                     remaining,
                 )
 
+                # Reconcile positions with Kalshi every 10s
+                if entries_placed:
+                    await asyncio.to_thread(self.order_manager.reconcile_positions)
+
                 await asyncio.sleep(10)
 
         self.order_manager.cancel_all_take_profits()
