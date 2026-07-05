@@ -327,34 +327,17 @@ class WindowBot:
         all_assets = list(set(self.config.yes_assets + self.config.no_assets))
         self.reentry_candidates.clear()
 
-        # Markets already detected via WS ticker — just need close_time metadata
         if not self.current_markets:
             logger.warning("No markets available for window %s", self.current_window_id)
             return
 
-        # One REST call per window to get close_time for TP cancellation timing
-        close_times = []
-        for asset, market in list(self.current_markets.items()):
-            try:
-                md = await asyncio.to_thread(self.rest.get_market, market["ticker"])
-                ct = _market_close_time(md)
-                if ct:
-                    close_times.append(ct)
-            except Exception:
-                pass
-
-        if close_times:
-            self.current_window_close = min(close_times)
-            logger.info(
-                "Window close time set to %s", self.current_window_close.isoformat()
-            )
-        else:
-            # Fallback: 15-min window from now
-            self.current_window_close = now + timedelta(minutes=15)
-            logger.info(
-                "Close time unavailable — using fallback %s",
-                self.current_window_close.isoformat(),
-            )
+        # Close time: next 15-min boundary (no REST call needed)
+        aligned = now.replace(second=0, microsecond=0)
+        mins = 15 - (now.minute % 15)
+        if mins == 15:
+            mins = 0
+        self.current_window_close = aligned + timedelta(minutes=mins)
+        logger.info("Window close at %s", self.current_window_close.isoformat())
 
         # Tiny randomized wait so the book has a moment to form
         await asyncio.sleep(random.uniform(0.5, 1.5))
