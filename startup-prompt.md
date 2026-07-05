@@ -63,6 +63,19 @@ in order to use you effectively this session.
 This is a **documentation review only** — do not make live API calls
 to Kalshi during onboarding unless I explicitly ask you to.
 
+## ⚠️ CRITICAL RULE: TRUST KALSHI'S DATA FEED
+
+**Kalshi's WebSocket provides live bid/ask prices directly via the `ticker`
+channel (`yes_bid_dollars`/`yes_ask_dollars`). Do not compute, cache, or
+reconstruct prices locally. Do not poll REST endpoints for data that the
+WS already provides. If Kalshi sends it, use it. No local math. No local
+caching. No REST fallbacks.**
+
+This rule applies everywhere: price display, entry decisions, stop
+monitoring, TP checks, re-entry logic. If you find yourself computing
+a mid-price or caching a value, stop and check if Kalshi already has
+that field. It does.
+
 When you read this file, also review the following in `ai/` to refresh
 your understanding of how the exchange behaves, in case anything has
 changed since your last session:

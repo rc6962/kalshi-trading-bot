@@ -94,6 +94,21 @@ class KalshiWebSocket:
         except Exception:
             logger.exception("Failed to send unsubscribe message")
 
+    async def subscribe_global(self, channels: list[str]) -> None:
+        """Subscribe to channels without market tickers (e.g. ticker for all markets)."""
+        if not self.websocket or not self.connected:
+            raise RuntimeError("WebSocket not connected")
+
+        sub_msg = {
+            "id": int(time.time() * 1000),
+            "cmd": "subscribe",
+            "params": {
+                "channels": channels,
+            },
+        }
+        await self.websocket.send(json.dumps(sub_msg))
+        logger.info("Subscribed to global channels %s", channels)
+
     async def subscribe(
         self, market_tickers: list[str], channels: list[str] | None = None
     ) -> None:

@@ -3,6 +3,25 @@
 
 ---
 
+## ⚠️ GOLDEN RULE — Trust Kalshi's data feed, always
+
+**Never compute, cache, or reconstruct data that Kalshi's WebSocket
+provides live.** The `ticker` channel sends `yes_bid_dollars` and
+`yes_ask_dollars` for every market every time they change. Use those
+directly. No local math. No REST polling for price data. No caching
+values when a live feed exists.
+
+If you are about to write any code that involves:
+- A mid-price computation
+- A price cache
+- A REST call for market data
+- Any `Decimal` or `float` arithmetic on bid/ask
+
+Stop and check if the WS `ticker` channel already has what you need.
+It does.
+
+---
+
 ## 2026-07-05 — Window Bot final design decisions
 
 After extensive testing and correction, these are the locked decisions

@@ -235,7 +235,9 @@ class WindowBot:
         self.reentry_candidates: set[str] = (
             set()
         )  # assets whose TP filled, waiting for 50/50
-        self._asset_mid_prices: dict[str, Decimal] = {}  # latest mid-price per asset
+        self._last_ticker: dict[
+            str, dict[str, Any]
+        ] = {}  # raw WS ticker data per asset
 
     # ------------------------------------------------------------------
     # Main loop
@@ -256,19 +258,13 @@ class WindowBot:
         self.ws.register_callback("orderbook_delta", self._on_orderbook_delta)
         self.ws.register_callback("ticker", self._on_ticker)
 
-        # Immediately discover markets and subscribe so price data flows.
-        all_assets = list(set(self.config.yes_assets + self.config.no_assets))
+        # Subscribe to global channels — ticker for ALL market prices,
+        # fill for all fills, lifecycle for market events. No REST needed.
         try:
-            markets = await asyncio.to_thread(discover_markets, self.rest, all_assets)
-            if markets:
-                tickers = [m["ticker"] for m in markets.values()]
-                if tickers:
-                    await self.ws.subscribe(tickers)
-                    logger.info(
-                        "Subscribed to %d tickers on startup: %s", len(tickers), tickers
-                    )
+            await self.ws.subscribe_global(["fill", "market_lifecycle_v2", "ticker"])
+            logger.info("Subscribed to global WS channels")
         except Exception:
-            logger.debug("No active markets at startup — will poll")
+            logger.debug("Global WS subscribe failed")
 
         try:
             while not self._shutdown:
@@ -289,66 +285,10 @@ class WindowBot:
                     await asyncio.sleep(2)
                     continue
 
-                # Not in a window — discover markets (source of truth for timing)
-                if not self.current_markets:
-                    markets = await asyncio.to_thread(
-                        discover_markets,
-                        self.rest,
-                        list(set(self.config.yes_assets + self.config.no_assets)),
-                    )
-                    if markets:
-                        earliest_close = min(
-                            _market_close_time(m)
-                            for m in markets.values()
-                            if _market_close_time(m)
-                        )
-                        if earliest_close:
-                            left = (
-                                earliest_close - datetime.now(timezone.utc)
-                            ).total_seconds()
-                            if left > 180:
-                                logger.info("Markets found — entering window")
-                                await self._execute_window()
-                                continue
-                            else:
-                                logger.info(
-                                    "Markets closing in %.0fs — waiting for next",
-                                    left,
-                                )
-
-                    # Show current status every 10s while waiting
-                    price_parts = []
-                    for asset in sorted(
-                        set(self.config.yes_assets + self.config.no_assets)
-                    ):
-                        mid = self._asset_mid_prices.get(asset)
-                        price_parts.append(
-                            f"{asset}=${mid:.4f}" if mid else f"{asset}=?"
-                        )
-                    price_status = " | ".join(price_parts)
-                    logger.info(
-                        "Polling for markets — %s",
-                        price_status,
-                    )
-
-                    await asyncio.sleep(1)
-                else:
-                    # In a window — main loop is idle while WS handles monitoring.
-                    # If the window close time has passed by >30s without a
-                    # settlement event, force-clear so we don't hang forever.
-                    if (
-                        self.current_window_close
-                        and (
-                            datetime.now(timezone.utc) - self.current_window_close
-                        ).total_seconds()
-                        > 30
-                    ):
-                        logger.warning(
-                            "Window close time %s passed — clearing stale markets",
-                            self.current_window_close,
-                        )
-                        self.current_markets = {}
-                    await asyncio.sleep(1)
+                # WS data drives everything — ticker/fill/lifecycle channels
+                # stream prices, fills, and market events in real-time.
+                # No REST polling needed.
+                await asyncio.sleep(1)
         except asyncio.CancelledError:
             logger.info("Bot loop cancelled")
         finally:
@@ -449,26 +389,10 @@ class WindowBot:
         except Exception:
             logger.exception("Failed to subscribe to tickers")
 
-        # Seed price cache with REST orderbook so prices show immediately
-        for asset, market in self.current_markets.items():
-            if (
-                asset not in self._asset_mid_prices
-                or self._asset_mid_prices.get(asset) is None
-            ):
-                try:
-                    ob = await asyncio.to_thread(
-                        self.orderbook.get_parsed, market["ticker"]
-                    )
-                    mid = (ob["yes_bid"] + ob["yes_ask"]) / Decimal("2")
-                    self._asset_mid_prices[asset] = mid
-                except Exception:
-                    pass
-
-        # Place initial entry orders only if prices are near 50/50 (0.40-0.60).
-        # If outside range, the status loop watches and enters when they normalize.
+        # Live status/monitoring loop until T-60s
+        # Prices come from the WS ticker channel — no local math, no REST seed.
         entries_placed = False
 
-        # Live status/monitoring loop until T-60s
         if self.current_window_close:
             close_time = self.current_window_close
             while True:
@@ -484,12 +408,13 @@ class WindowBot:
                     all_in_range = True
                     for plan in planned_entries:
                         asset = plan["asset"]
-                        mid = self._asset_mid_prices.get(asset)
-                        if (
-                            mid is None
-                            or mid < Decimal("0.40")
-                            or mid > Decimal("0.60")
-                        ):
+                        t = self._last_ticker.get(asset)
+                        if not t:
+                            all_in_range = False
+                            break
+                        bid = float(t["yes_bid_dollars"])
+                        ask = float(t["yes_ask_dollars"])
+                        if bid < 0.40 or bid > 0.60 or ask < 0.40 or ask > 0.60:
                             all_in_range = False
                             break
 
@@ -511,13 +436,18 @@ class WindowBot:
                                 )
                         entries_placed = True
 
-                # Build status line
+                # Build status line using raw ticker data (bid/ask from Kalshi)
                 parts = []
                 for asset in sorted(
                     set(self.config.yes_assets + self.config.no_assets)
                 ):
-                    mid = self._asset_mid_prices.get(asset)
-                    price_str = f"${mid:.4f}" if mid else "?"
+                    t = self._last_ticker.get(asset)
+                    if t:
+                        bid = float(t["yes_bid_dollars"])
+                        ask = float(t["yes_ask_dollars"])
+                        price_str = f"${bid:.4f}/${ask:.4f}"
+                    else:
+                        price_str = "?"
 
                     # Check if this asset has an active filled entry
                     side_label = ""
@@ -670,41 +600,56 @@ class WindowBot:
         pass
 
     async def _on_ticker(self, data: dict[str, Any]) -> None:
-        """Handle ticker updates from WS.  Contains yes_bid_dollars and
-        yes_ask_dollars — the actual current market prices."""
+        """Handle ticker updates from WS. Contains yes_bid_dollars and
+        yes_ask_dollars directly from Kalshi — no local math needed."""
         msg = data.get("msg", data)
-        ticker = msg.get("market_ticker") or msg.get("ticker")
+        ticker_str = msg.get("market_ticker") or msg.get("ticker")
 
-        yes_bid = msg.get("yes_bid_dollars")
-        yes_ask = msg.get("yes_ask_dollars")
-
-        if not yes_bid or not yes_ask:
+        if (
+            not ticker_str
+            or not msg.get("yes_bid_dollars")
+            or not msg.get("yes_ask_dollars")
+        ):
             return
 
-        market_price = (float(yes_bid) + float(yes_ask)) / 2
+        # Detect 15-min crypto markets by ticker prefix and auto-subscribe
+        from kalshi.market_discovery import ASSET_TO_SERIES
 
-        # Cache latest mid-price
-        for asset, market in self.current_markets.items():
-            if market.get("ticker") == ticker:
-                self._asset_mid_prices[asset] = Decimal(str(market_price))
+        for asset, series in ASSET_TO_SERIES.items():
+            if ticker_str.startswith(series) and asset not in self.current_markets:
+                self.current_markets[asset] = {"ticker": ticker_str}
+                try:
+                    await self.ws.subscribe([ticker_str], ["orderbook_delta"])
+                    logger.info(
+                        "Auto-detected %s market: %s — subscribed to orderbook_delta",
+                        asset,
+                        ticker_str,
+                    )
+                except Exception:
+                    pass
                 break
 
-        # Route to OrderManager: check stop levels and TP proximity
+        # Store raw ticker data
+        for asset, market in self.current_markets.items():
+            if market.get("ticker") == ticker_str:
+                self._last_ticker[asset] = msg
+                break
+
+        # Route to OrderManager using Kalshi's prices directly
+        yes_bid = float(msg["yes_bid_dollars"])
+        yes_ask = float(msg["yes_ask_dollars"])
+
         await asyncio.to_thread(
             self.order_manager.check_stop_escalation,
-            ticker,
-            market_price,
+            ticker_str,
+            (yes_bid + yes_ask) / 2,
         )
-
-        # TP proximity check
         await asyncio.to_thread(
             self.order_manager.check_tp_proximity,
-            ticker,
-            market_price,
+            ticker_str,
+            (yes_bid + yes_ask) / 2,
         )
-
-        # Re-entry check
-        await self._check_reentry(ticker, market_price)
+        await self._check_reentry(ticker_str, (yes_bid + yes_ask) / 2)
 
     # ------------------------------------------------------------------
     # Helpers
