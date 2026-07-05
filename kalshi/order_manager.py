@@ -79,6 +79,7 @@ class OrderManager:
         side: str,
         price: Decimal,
         count: Decimal,
+        stop_width: Decimal = Decimal("0.15"),
     ) -> EntryState:
         """Place a single entry order and return its state."""
         client_order_id = str(uuid.uuid4())
@@ -104,6 +105,7 @@ class OrderManager:
             entry_price=price,
             requested_count=count,
             remaining_count=count,
+            stop_width=stop_width,
             order_id=order_id,
         )
         with self._lock:
@@ -318,26 +320,36 @@ class OrderManager:
         return "ask" if entry.side == "bid" else "bid"
 
     def _stop_price(self, entry: EntryState) -> Decimal:
-        """Compute primary stop price level.
+        """Compute primary stop price level relative to entry price.
 
-        YES entries (long YES): fixed at $0.20
-        NO entries (long NO): fixed at $0.80
+        YES long (bid entry):  sell stop at entry_price - stop_width
+        NO long (ask entry):   buy stop at entry_price + stop_width
+
+        Example with entry ~$0.50 and stop_width=$0.15:
+          YES primary stop at $0.35, NO primary stop at $0.65
         """
         if entry.side == "bid":
-            return Decimal("0.20")
+            return max(Decimal("0.01"), entry.entry_price - entry.stop_width)
         else:
-            return Decimal("0.80")
+            return min(Decimal("0.99"), entry.entry_price + entry.stop_width)
 
     def _stop_price_2(self, entry: EntryState) -> Decimal:
-        """Compute secondary stop price level (tighter by 2 cents).
+        """Compute secondary stop price level (2¢ closer to entry price
+        than primary, making it the first line of defense).
 
-        YES entries: $0.22
-        NO entries: $0.78
+        YES long (bid entry):  sell stop at primary + 0.02
+        NO long (ask entry):   buy stop at primary - 0.02
         """
         if entry.side == "bid":
-            return Decimal("0.22")
+            return min(
+                entry.entry_price,
+                self._stop_price(entry) + Decimal("0.02"),
+            )
         else:
-            return Decimal("0.78")
+            return max(
+                entry.entry_price,
+                self._stop_price(entry) - Decimal("0.02"),
+            )
 
     def _take_profit_price(self, entry: EntryState) -> Decimal:
         """Compute take-profit price for the entry.
