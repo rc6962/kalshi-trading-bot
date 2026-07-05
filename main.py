@@ -355,7 +355,7 @@ class WindowBot:
         msg = data.get("msg", data)
         order_id = msg.get("order_id")
         client_order_id = msg.get("client_order_id")
-        fill_price = msg.get("price_dollars") or msg.get("fill_price_dollars")
+        fill_price = msg.get("yes_price_dollars") or msg.get("price_dollars") or msg.get("fill_price_dollars")
         fill_count = msg.get("count_fp") or msg.get("fill_count")
 
         if not fill_price or not fill_count:
@@ -389,7 +389,7 @@ class WindowBot:
         msg = data.get("msg", data)
         ticker = msg.get("market_ticker") or msg.get("ticker")
         result = msg.get("result")
-        settlement_price = msg.get("settlement_price_dollars")
+        settlement_price = msg.get("settlement_value") or msg.get("settlement_price_dollars")
         logger.info("Settlement: %s -> %s @ %s", ticker, result, settlement_price)
         await asyncio.to_thread(
             self.order_manager.on_settlement,
@@ -428,19 +428,24 @@ class WindowBot:
         return {}
 
     def _next_window_open(self) -> datetime:
-        """Return the next 15-minute boundary (:00, :15, :30, :45)."""
+        """Return the next 15-minute boundary (:00, :15, :30, :45).
+
+        If exactly on a boundary, add a small grace period so that discovery
+        happens after the window has actually opened rather than the exact
+        moment (which can race with exchange listing).
+        """
         now = datetime.now(timezone.utc)
         aligned = now.replace(second=0, microsecond=0)
         minutes_to_add = 15 - (now.minute % 15)
-        # If exactly on a boundary, use current window (not next)
         if minutes_to_add == 15:
             minutes_to_add = 0
-        return aligned + timedelta(minutes=minutes_to_add)
+        return aligned + timedelta(minutes=minutes_to_add, seconds=2)
 
     def _daily_realized_pnl(self) -> float:
         """Calculate accurate realized PnL from completed trades today.
 
         Uses stop_fill and settlement events to compute exact profit/loss.
+        Aggregates partial fills per entry (by client_order_id) to avoid double-counting.
         """
         from collections import defaultdict
 
@@ -475,57 +480,67 @@ class WindowBot:
             if parent_id:
                 stopped_entry_ids.add(parent_id)
 
-        # Pre-bucket entry fills by ticker for O(1) lookup
-        entries_by_ticker: dict[str, list[dict]] = defaultdict(list)
-        for e in entry_fills:
-            entries_by_ticker[e["ticker"]].append(e)
+        # Aggregate partial fills by entry (client_order_id) to get total filled
+        # This prevents double-counting when an entry has multiple partial fills
+        entries_by_client_id: dict[str, dict[str, Any]] = {}
+        for fill_event in entry_fills:
+            client_id = fill_event.get("client_order_id")
+            if not client_id:
+                continue
 
-        # Sort each bucket by timestamp ascending so we can find earliest-before-stop
-        for bucket in entries_by_ticker.values():
-            bucket.sort(key=lambda x: x["ts"])
+            if client_id not in entries_by_client_id:
+                entries_by_client_id[client_id] = {
+                    "ticker": fill_event["ticker"],
+                    "side": fill_event.get("side", "bid"),
+                    "entry_price": float(fill_event.get("entry_price", "0.0")),
+                    "total_filled": Decimal("0"),
+                }
+            entries_by_client_id[client_id]["total_filled"] += Decimal(fill_event.get("fill_count", "0"))
+
+        # Pre-bucket entries by ticker for O(1) lookup during settlement
+        entries_by_ticker: dict[str, list[str]] = defaultdict(list)
+        for client_id, entry in entries_by_client_id.items():
+            entries_by_ticker[entry["ticker"]].append(client_id)
 
         # Process stop fills
         for stop_event in stop_fills:
-            stop_ticker = stop_event["ticker"]
             stop_price = float(stop_event["fill_price"])
             fill_count = float(stop_event["fill_count"])
             entry_price = float(stop_event.get("entry_price", "0.0"))
 
             if entry_price > stop_price:
-                # Long YES: sold at stop_price after buying at entry_price
                 trade_pnl = (stop_price - entry_price) * fill_count
             else:
-                # Long NO: bought back at stop_price after selling at entry_price
                 trade_pnl = (entry_price - stop_price) * fill_count
             pnl += trade_pnl
 
-        # Process settlements: find entries that were not closed by stop
+        # Process settlements: find entries not closed by stop
         for settlement_event in settlements:
             ticker = settlement_event["ticker"]
             result = settlement_event["result"]
-            settlement_price = settlement_event["settlement_price"]
+            settlement_price = settlement_event.get("settlement_price")
             if settlement_price is None:
                 settlement_price = "0.99" if result == "yes" else "0.00"
             settlement_price = float(settlement_price)
 
-            # Find all entry fills for this ticker
-            candidates = entries_by_ticker.get(ticker, [])
-            if not candidates:
+            # Find all entry client_ids for this ticker
+            client_ids = entries_by_ticker.get(ticker, [])
+            if not client_ids:
                 continue
 
-            for entry_event in candidates:
-                # Skip entries that were already closed by stop-loss
-                entry_client_id = entry_event.get("client_order_id")
-                if entry_client_id and entry_client_id in stopped_entry_ids:
+            for client_id in client_ids:
+                # Skip entries closed by stop-loss
+                if client_id in stopped_entry_ids:
                     continue
 
-                entry_price = float(entry_event.get("entry_price", "0.0"))
-                fill_count = float(entry_event.get("fill_count", "0"))
-                side = entry_event.get("side", "bid")
+                entry = entries_by_client_id[client_id]
+                entry_price = entry["entry_price"]
+                fill_count = float(entry["total_filled"])
+                side = entry["side"]
 
-                if side == "bid":  # long YES
+                if side == "bid":
                     trade_pnl = (settlement_price - entry_price) * fill_count
-                else:  # long NO (short YES)
+                else:
                     trade_pnl = (entry_price - settlement_price) * fill_count
                 pnl += trade_pnl
 
