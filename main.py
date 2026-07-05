@@ -236,10 +236,6 @@ class WindowBot:
             set()
         )  # assets whose TP filled, waiting for 50/50
         self._asset_mid_prices: dict[str, Decimal] = {}  # latest mid-price per asset
-        self._last_skip_reason: str = ""  # ticker-side:price that caused last skip
-        self._skipped_close: datetime | None = (
-            None  # close time we skipped, to prevent re-trigger
-        )
 
     # ------------------------------------------------------------------
     # Main loop
@@ -251,7 +247,6 @@ class WindowBot:
 
         # Start WebSocket listener in background
         ws_task = asyncio.create_task(self.ws.listen())
-        # Give WS a moment to connect
         await asyncio.sleep(2)
 
         # Register callbacks
@@ -261,18 +256,18 @@ class WindowBot:
         self.ws.register_callback("orderbook_delta", self._on_orderbook_delta)
 
         # Immediately discover markets and subscribe so price data flows.
-        # This lets the bot detect 50/50 mid-window for early entry.
         all_assets = list(set(self.config.yes_assets + self.config.no_assets))
         try:
             markets = await asyncio.to_thread(discover_markets, self.rest, all_assets)
             if markets:
                 tickers = [m["ticker"] for m in markets.values()]
-                await self.ws.subscribe(tickers)
-                logger.info(
-                    "Subscribed to %d tickers on startup: %s", len(tickers), tickers
-                )
+                if tickers:
+                    await self.ws.subscribe(tickers)
+                    logger.info(
+                        "Subscribed to %d tickers on startup: %s", len(tickers), tickers
+                    )
         except Exception:
-            logger.debug("No active markets at startup — will retry in main loop")
+            logger.debug("No active markets at startup — will poll")
 
         try:
             while not self._shutdown:
@@ -293,77 +288,53 @@ class WindowBot:
                     await asyncio.sleep(5)
                     continue
 
-                next_open = self._next_window_open()
-                wait_seconds = (next_open - datetime.now(timezone.utc)).total_seconds()
-                pre_open_buffer = 10
-                sleep_seconds = max(0, wait_seconds - pre_open_buffer)
-                if sleep_seconds > 10:
-                    entered_early = False
-                    while sleep_seconds > 10 and not self._shutdown:
-                        # Show prices + countdown every 10s
-                        price_parts = []
-                        for asset in sorted(
-                            set(self.config.yes_assets + self.config.no_assets)
-                        ):
-                            mid = self._asset_mid_prices.get(asset)
-                            price_parts.append(
-                                f"{asset}=${mid:.4f}" if mid else f"{asset}=?"
-                            )
-                        price_status = " | ".join(price_parts)
-                        logger.info(
-                            "Next window at %s ET — T-minus %.0fs — %s",
-                            _fmt_est(next_open),
-                            sleep_seconds,
-                            price_status,
+                # Not in a window — discover markets (source of truth for timing)
+                if not self.current_markets:
+                    markets = await asyncio.to_thread(
+                        discover_markets,
+                        self.rest,
+                        list(set(self.config.yes_assets + self.config.no_assets)),
+                    )
+                    if markets:
+                        earliest_close = min(
+                            _market_close_time(m)
+                            for m in markets.values()
+                            if _market_close_time(m)
                         )
-
-                        # Probe for markets every 10s if we haven't already
-                        # found them (current_markets is empty = not in a window)
-                        if not self.current_markets:
-                            try:
-                                markets = await asyncio.to_thread(
-                                    discover_markets,
-                                    self.rest,
-                                    list(
-                                        set(
-                                            self.config.yes_assets
-                                            + self.config.no_assets
-                                        )
-                                    ),
+                        if earliest_close:
+                            left = (
+                                earliest_close - datetime.now(timezone.utc)
+                            ).total_seconds()
+                            if left > 180:
+                                logger.info("Markets found — entering window")
+                                await self._execute_window()
+                                continue
+                            else:
+                                logger.info(
+                                    "Markets closing in %.0fs — waiting for next",
+                                    left,
                                 )
-                                if markets:
-                                    earliest_close = min(
-                                        _market_close_time(m)
-                                        for m in markets.values()
-                                        if _market_close_time(m)
-                                    )
-                                    if earliest_close:
-                                        left = (
-                                            earliest_close - datetime.now(timezone.utc)
-                                        ).total_seconds()
-                                        if left > 180:
-                                            logger.info(
-                                                "Markets found — entering window"
-                                            )
-                                            entered_early = True
-                                            break
-                            except Exception:
-                                pass
 
-                        await asyncio.sleep(min(10, sleep_seconds - 10))
-                        sleep_seconds = max(
-                            0,
-                            (next_open - datetime.now(timezone.utc)).total_seconds()
-                            - 10,
+                    # Show current status every 10s while waiting
+                    price_parts = []
+                    for asset in sorted(
+                        set(self.config.yes_assets + self.config.no_assets)
+                    ):
+                        mid = self._asset_mid_prices.get(asset)
+                        price_parts.append(
+                            f"{asset}=${mid:.4f}" if mid else f"{asset}=?"
                         )
+                    price_status = " | ".join(price_parts)
+                    logger.info(
+                        "Polling for markets — %s",
+                        price_status,
+                    )
 
-                    if entered_early:
-                        await self._execute_window()
-                        continue
-                elif sleep_seconds > 0:
-                    await asyncio.sleep(sleep_seconds)
-
-                await self._execute_window()
+                    await asyncio.sleep(10)
+                else:
+                    # In a window — main loop is idle while WS handles monitoring.
+                    # Just sleep and let the window finish.
+                    await asyncio.sleep(10)
         except asyncio.CancelledError:
             logger.info("Bot loop cancelled")
         finally:
@@ -401,15 +372,6 @@ class WindowBot:
             logger.info(
                 "Window close time set to %s", self.current_window_close.isoformat()
             )
-
-        # If we already skipped THIS exact window close time, don't re-check.
-        # Uses the fresh close time from discovery, not a stale one.
-        if self._skipped_close and self.current_window_close == self._skipped_close:
-            logger.info(
-                "Already skipped close=%s — waiting for next window",
-                self.current_window_close,
-            )
-            return
 
         # Tiny randomized wait so the book has a moment to form
         await asyncio.sleep(random.uniform(0.5, 1.5))
@@ -487,41 +449,6 @@ class WindowBot:
                     self._asset_mid_prices[asset] = mid
                 except Exception:
                     pass
-
-        # Re-entry check for price change — if we skipped this window
-        # before and prices have moved (cached via WS), try again.
-        if self.current_markets and self._last_skip_reason:
-            prices_now = ""
-            for asset in sorted(set(self.config.yes_assets + self.config.no_assets)):
-                m = self._asset_mid_prices.get(asset)
-                prices_now += f"{asset}={m or 0} "
-            if prices_now == self._last_skip_reason:
-                logger.info("Prices unchanged since last skip — skipping window")
-                self._skipped_close = self.current_window_close
-                return
-            else:
-                logger.info("Prices changed — re-checking entry conditions")
-                self._last_skip_reason = ""
-
-        # Sanity check: skip if any entry price is too far from 50/50
-        for plan in planned_entries:
-            p = Decimal(str(plan["price"]))
-            if p < Decimal("0.40") or p > Decimal("0.60"):
-                logger.warning(
-                    "%s entry price %.4f too far from 50/50 — skipping window",
-                    plan["asset"],
-                    p,
-                )
-                # Record the price snapshot so the probe won't retry until prices change
-                prices = ""
-                for asset in sorted(
-                    set(self.config.yes_assets + self.config.no_assets)
-                ):
-                    m = self._asset_mid_prices.get(asset)
-                    prices += f"{asset}={m or 0} "
-                self._last_skip_reason = prices
-                self._skipped_close = self.current_window_close
-                return
 
         # Risk checks
         max_loss = estimated_max_loss_for_window(planned_entries)
@@ -782,20 +709,6 @@ class WindowBot:
                 logger.exception("Market discovery poll failed")
             await asyncio.sleep(poll_interval)
         return {}
-
-    def _next_window_open(self) -> datetime:
-        """Return the next 15-minute boundary (:00, :15, :30, :45).
-
-        If exactly on a boundary, add a small grace period so that discovery
-        happens after the window has actually opened rather than the exact
-        moment (which can race with exchange listing).
-        """
-        now = datetime.now(timezone.utc)
-        aligned = now.replace(second=0, microsecond=0)
-        minutes_to_add = 15 - (now.minute % 15)
-        if minutes_to_add == 15:
-            minutes_to_add = 0
-        return aligned + timedelta(minutes=minutes_to_add, seconds=2)
 
     async def _check_reentry(self, ticker: str, market_price: float) -> None:
         """Check whether ALL session assets have TP'd and returned to 50/50.
