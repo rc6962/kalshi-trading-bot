@@ -273,7 +273,7 @@ class WindowBot:
             while not self._shutdown:
                 if self.risk_guard.kill_switch_active():
                     logger.warning("Kill switch active. Halting new entries.")
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(2)
                     continue
 
                 if self.risk_guard.check_daily_loss(
@@ -285,7 +285,7 @@ class WindowBot:
 
                 if not self.ws.connected:
                     logger.warning("WebSocket not connected. Waiting...")
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(2)
                     continue
 
                 # Not in a window — discover markets (source of truth for timing)
@@ -330,7 +330,7 @@ class WindowBot:
                         price_status,
                     )
 
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(1)
                 else:
                     # In a window — main loop is idle while WS handles monitoring.
                     # If the window close time has passed by >30s without a
@@ -347,7 +347,7 @@ class WindowBot:
                             self.current_window_close,
                         )
                         self.current_markets = {}
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(1)
         except asyncio.CancelledError:
             logger.info("Bot loop cancelled")
         finally:
@@ -538,11 +538,11 @@ class WindowBot:
                     remaining,
                 )
 
-                # Reconcile positions with Kalshi every 10s
+                # Reconcile positions with Kalshi every loop
                 if entries_placed:
                     await asyncio.to_thread(self.order_manager.reconcile_positions)
 
-                await asyncio.sleep(10)
+                await asyncio.sleep(1)
 
         self.order_manager.cancel_all_take_profits()
         logger.info("Canceled take-profit orders — survivors ride to $1.00 settlement")
