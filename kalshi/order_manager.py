@@ -40,6 +40,8 @@ class EntryState:
     order_id: str | None = None
     stop_order_id: str | None = None
     stop_client_order_id: str | None = None
+    stop_order_id_2: str | None = None  # Second dual stop for redundancy
+    stop_client_order_id_2: str | None = None
     tp_order_id: str | None = None
     tp_client_order_id: str | None = None
     tp_price: Decimal | None = None
@@ -181,32 +183,46 @@ class OrderManager:
             fill_count: str,
             fill_side: str = "taker",
         ) -> None:
-        """Handle a stop fill event."""
-        # Try to resolve associated entry for richer logging
+        """Handle a stop fill event. Cancels other dual stop and take-profit."""
         asset = "unknown"
         ticker = "unknown"
         side = "unknown"
         parent_entry_client_order_id = None
         entry_price = None
+        matched_entry = None
 
         with self._lock:
-            # The stop's client_order_id maps back to the entry via stop_client_order_id
+            # Find entry by either stop client_order_id (primary or secondary)
             for entry in self.entries.values():
-                if entry.stop_client_order_id == client_order_id:
+                if (entry.stop_client_order_id == client_order_id or
+                    entry.stop_client_order_id_2 == client_order_id):
                     asset = entry.asset
                     ticker = entry.ticker
                     side = entry.side
                     parent_entry_client_order_id = entry.client_order_id
+                    entry_price = self.stop_to_parent_entry_price.get(order_id)
+                    matched_entry = entry
                     break
-
-            # Look up the parent entry price while still holding the lock
-            entry_price = self.stop_to_parent_entry_price.get(order_id)
 
         if entry_price is None:
             logger.warning("Stop fill received but no parent entry price found for order_id=%s", order_id)
             entry_price_str = "0.0000"
         else:
             entry_price_str = str(entry_price)
+
+        # Cancel the OTHER dual stop and take-profit (outside lock to avoid blocking)
+        if matched_entry:
+            self._cancel_dual_stops(matched_entry)
+            # Cancel take-profit if still active
+            if matched_entry.tp_order_id and not matched_entry.tp_filled:
+                self._cancel_order(matched_entry.tp_order_id, matched_entry.tp_client_order_id)
+                with self._lock:
+                    self.tp_order_ids.discard(matched_entry.tp_order_id)
+                    self.order_id_to_client.pop(matched_entry.tp_order_id, None)
+                    matched_entry.tp_order_id = None
+                    matched_entry.tp_client_order_id = None
+                    matched_entry.tp_filled = True
+                logger.info("Cancelled take-profit for %s after stop fill", asset)
 
         self.trade_log.log_event(
             "stop_fill",
@@ -274,18 +290,31 @@ class OrderManager:
         return "ask" if entry.side == "bid" else "bid"
 
     def _stop_price(self, entry: EntryState) -> Decimal:
-        """Compute aggressive IoC stop price.
+        """Compute primary stop price level.
 
         For a long YES position, we need to sell YES below current market.
         For a long NO position, we need to buy YES back above current market.
         """
-        buffer = Decimal(str(self.settings.ioc_fallback_buffer))
         if entry.side == "bid":
-            # Long YES: sell to flatten. Price = entry - stop_width - buffer.
-            return max(Decimal("0.01"), entry.entry_price - entry.stop_width - buffer)
+            # Long YES: sell to flatten. Price = entry - stop_width.
+            return max(Decimal("0.01"), entry.entry_price - entry.stop_width)
         else:
-            # Long NO: buy YES back. Price = entry + stop_width + buffer.
-            return min(Decimal("0.99"), entry.entry_price + entry.stop_width + buffer)
+            # Long NO: buy YES back. Price = entry + stop_width.
+            return min(Decimal("0.99"), entry.entry_price + entry.stop_width)
+
+    def _stop_price_2(self, entry: EntryState) -> Decimal:
+        """Compute secondary stop price level (closer to entry for dual-stop strategy).
+
+        For YES: place slightly above the primary stop (2 cents tighter)
+        For NO: place slightly below the primary stop (2 cents tighter)
+        """
+        buffer = Decimal("0.02")
+        if entry.side == "bid":
+            # Long YES: secondary stop is closer (higher price)
+            return max(Decimal("0.01"), entry.entry_price - entry.stop_width + buffer)
+        else:
+            # Long NO: secondary stop is closer (lower price)
+            return min(Decimal("0.99"), entry.entry_price + entry.stop_width - buffer)
 
     def _take_profit_price(self, entry: EntryState) -> Decimal:
         """Compute take-profit price for the entry.
@@ -444,26 +473,41 @@ class OrderManager:
             logger.exception("Failed to place IOC stop for remaining for %s", entry.asset)
 
     def _place_stop_order(self, entry: EntryState) -> None:
-        """Place a limit stop-loss order first (to avoid taker fees).
+        """Place dual limit stop-loss orders first (to avoid taker fees).
 
-        If market passes our stop level, we'll escalate to IOC later.
+        Places two stops at different price levels:
+        - Primary stop: entry_price +/- stop_width
+        - Secondary stop: slightly tighter (entry_price +/- stop_width +/- 0.02)
+        When either fills, the other is cancelled.
         """
         if entry.filled_count <= Decimal("0"):
             return
 
-        # Cancel any existing stop before placing a new one
-        if entry.stop_order_id:
-            self._cancel_order(entry.stop_order_id, entry.stop_client_order_id)
-            with self._lock:
-                self.order_id_to_client.pop(entry.stop_order_id, None)
-                self.stop_order_ids.discard(entry.stop_order_id)
+        # Cancel any existing dual stops before placing new ones
+        self._cancel_dual_stops(entry)
 
         side = self._stop_side(entry)
-        price = self._stop_price(entry)
         count = entry.filled_count
-        client_order_id = str(uuid.uuid4())
 
-        # First try a limit order (GTC) to avoid taker fees
+        # Primary stop (farther from entry)
+        price_1 = self._stop_price(entry)
+        client_id_1 = str(uuid.uuid4())
+
+        # Secondary stop (closer to entry)
+        price_2 = self._stop_price_2(entry)
+        client_id_2 = str(uuid.uuid4())
+
+        # Place primary stop
+        self._place_single_limit_stop(entry, side, price_1, client_id_1, "primary")
+        # Place secondary stop
+        self._place_single_limit_stop(entry, side, price_2, client_id_2, "secondary")
+
+    def _place_single_limit_stop(
+        self, entry: EntryState, side: str, price: Decimal, client_id: str, label: str
+    ) -> None:
+        """Place a single limit stop order."""
+        count = entry.filled_count
+
         payload = {
             "ticker": entry.ticker,
             "side": side,
@@ -471,37 +515,37 @@ class OrderManager:
             "price": _fmt_decimal(price),
             "time_in_force": "good_till_canceled",
             "self_trade_prevention_type": "taker_at_cross",
-            "client_order_id": client_order_id,
-            "post_only": True,  # Only post as maker, don't cross spread
+            "client_order_id": client_id,
+            "post_only": True,
             "reduce_only": True,
         }
 
         try:
             response = self.rest.post("/portfolio/events/orders", json_data=payload)
-            with self._lock:
-                entry.stop_order_id = response.get("order_id")
-                entry.stop_client_order_id = client_order_id
+            order_id = response.get("order_id")
             status = response.get("status", "")
 
-            if not entry.stop_order_id or status in ("canceled", "rejected"):
+            if not order_id or status in ("canceled", "rejected"):
                 logger.warning(
-                    "Limit stop not posted for %s %s — placing IOC stop instead. Entry price: %s, Stop price: %s",
+                    "Limit stop (%s) not posted for %s %s at %s — will retry as IOC",
+                    label,
                     entry.asset,
                     entry.ticker,
-                    entry.entry_price,
                     price,
                 )
-                # Fall back to IOC if limit couldn't be posted
-                self._place_ioc_stop(entry)
+                self._place_single_ioc_stop(entry, side, price, client_id, label)
                 return
 
-            if entry.stop_order_id:
-                with self._lock:
-                    self.order_id_to_client[entry.stop_order_id] = client_order_id
-                    self.stop_order_ids.add(entry.stop_order_id)
-
-            filled = Decimal(str(response.get("fill_count", "0")))
-            remaining = count - filled
+            # Track which stop this is (primary or secondary)
+            with self._lock:
+                if label == "primary":
+                    entry.stop_order_id = order_id
+                    entry.stop_client_order_id = client_id
+                else:
+                    entry.stop_order_id_2 = order_id
+                    entry.stop_client_order_id_2 = client_id
+                self.order_id_to_client[order_id] = client_id
+                self.stop_order_ids.add(order_id)
 
             self.trade_log.log_event(
                 "stop_placed",
@@ -511,30 +555,193 @@ class OrderManager:
                     "side": side,
                     "price": str(price),
                     "count": str(count),
-                    "client_order_id": client_order_id,
-                    "order_id": entry.stop_order_id,
+                    "client_order_id": client_id,
+                    "order_id": order_id,
                     "type": "limit_maker",
+                    "label": label,
                     "entry_price": str(entry.entry_price),
-                    "filled_count": str(filled),
-                    "remaining_count": str(remaining),
                 },
             )
             logger.info(
-                "Placed limit stop %s %s @ %s (%s contracts, filled %s, remaining %s)",
+                "Placed limit stop (%s) %s %s @ %s (%s contracts)",
+                label,
                 entry.asset,
                 entry.ticker,
                 price,
                 count,
-                filled,
-                remaining,
             )
 
-            # If limit had partial fill, place IOC for remaining
-            if remaining > Decimal("0"):
-                self._place_ioc_stop_remaining(entry, remaining)
-
         except Exception:
-            logger.exception("Failed to place stop order for %s", entry.asset)
+            logger.exception("Failed to place stop order (%s) for %s", label, entry.asset)
+
+    def _place_single_ioc_stop(
+        self, entry: EntryState, side: str, price: Decimal, client_id: str, label: str
+    ) -> None:
+        """Place a single IOC stop order."""
+        count = entry.filled_count
+
+        payload = {
+            "ticker": entry.ticker,
+            "side": side,
+            "count": _fmt_count(count),
+            "price": _fmt_decimal(price),
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
+            "client_order_id": client_id,
+            "reduce_only": True,
+        }
+
+        try:
+            response = self.rest.post("/portfolio/events/orders", json_data=payload)
+            order_id = response.get("order_id")
+
+            with self._lock:
+                if label == "primary":
+                    entry.stop_order_id = order_id
+                    entry.stop_client_order_id = client_id
+                else:
+                    entry.stop_order_id_2 = order_id
+                    entry.stop_client_order_id_2 = client_id
+                self.order_id_to_client[order_id] = client_id
+                self.stop_order_ids.add(order_id)
+
+            logger.info(
+                "Placed IOC stop (%s) %s %s @ %s (as fallback)",
+                label,
+                entry.asset,
+                entry.ticker,
+                price,
+            )
+        except Exception:
+            logger.exception("Failed to place IOC stop (%s) for %s", label, entry.asset)
+
+    def _cancel_dual_stops(self, entry: EntryState) -> None:
+        """Cancel both dual stop orders for an entry."""
+        if entry.stop_order_id:
+            self._cancel_order(entry.stop_order_id, entry.stop_client_order_id)
+            with self._lock:
+                self.order_id_to_client.pop(entry.stop_order_id, None)
+                self.stop_order_ids.discard(entry.stop_order_id)
+            entry.stop_order_id = None
+            entry.stop_client_order_id = None
+
+        if entry.stop_order_id_2:
+            self._cancel_order(entry.stop_order_id_2, entry.stop_client_order_id_2)
+            with self._lock:
+                self.order_id_to_client.pop(entry.stop_order_id_2, None)
+                self.stop_order_ids.discard(entry.stop_order_id_2)
+            entry.stop_order_id_2 = None
+            entry.stop_client_order_id_2 = None
+
+    def check_stop_escalation(self, ticker: str, market_price: float) -> None:
+        """Check if market has passed stop levels. Escalate to IOC if needed."""
+        market_price = Decimal(str(market_price))
+
+        with self._lock:
+            for entry in list(self.entries.values()):
+                if entry.ticker != ticker:
+                    continue
+                if entry.filled_count <= Decimal("0"):
+                    continue
+
+                # Calculate our stop levels
+                if entry.side == "bid":
+                    # Long YES: stop prices are below entry
+                    # Primary stop = entry - stop_width
+                    # Secondary stop = entry - stop_width + 0.02
+                    primary_stop = entry.entry_price - entry.stop_width
+                    secondary_stop = entry.entry_price - entry.stop_width + Decimal("0.02")
+
+                    # If market is ABOVE our stops (price went up, we're winning)
+                    # Our SELL stops won't fill unless price drops
+                    # Check if market dropped past our stops
+                    if market_price <= primary_stop:
+                        # Market passed primary stop level - escalate to IOC
+                        logger.warning(
+                            "Market %s passed PRIMARY stop for %s (%s < %s) — escalating to IOC",
+                            market_price, entry.asset, market_price, primary_stop
+                        )
+                        self._escalate_to_ioc(entry)
+                    elif market_price <= secondary_stop and entry.stop_order_id_2:
+                        # Market passed secondary stop level
+                        logger.warning(
+                            "Market %s passed SECONDARY stop for %s (%s < %s) — escalating to IOC",
+                            market_price, entry.asset, market_price, secondary_stop
+                        )
+                        self._escalate_to_ioc(entry)
+                else:
+                    # Long NO: stop prices are above entry
+                    # Primary stop = entry + stop_width
+                    # Secondary stop = entry + stop_width - 0.02
+                    primary_stop = entry.entry_price + entry.stop_width
+                    secondary_stop = entry.entry_price + entry.stop_width - Decimal("0.02")
+
+                    # If market is BELOW our stops (price went down, we're winning)
+                    # Our BUY stops won't fill unless price rises
+                    # Check if market rose past our stops
+                    if market_price >= primary_stop:
+                        logger.warning(
+                            "Market %s passed PRIMARY stop for %s (%s > %s) — escalating to IOC",
+                            market_price, entry.asset, market_price, primary_stop
+                        )
+                        self._escalate_to_ioc(entry)
+                    elif market_price >= secondary_stop and entry.stop_order_id_2:
+                        logger.warning(
+                            "Market %s passed SECONDARY stop for %s (%s > %s) — escalating to IOC",
+                            market_price, entry.asset, market_price, secondary_stop
+                        )
+                        self._escalate_to_ioc(entry)
+
+    def _escalate_to_ioc(self, entry: EntryState) -> None:
+        """Cancel limit stops and place IOC for all remaining contracts."""
+        # Cancel both limit stops
+        self._cancel_dual_stops(entry)
+
+        # Place IOC for full filled count
+        side = self._stop_side(entry)
+        price = self._stop_price(entry)
+        count = entry.filled_count
+        client_id = str(uuid.uuid4())
+
+        payload = {
+            "ticker": entry.ticker,
+            "side": side,
+            "count": _fmt_count(count),
+            "price": _fmt_decimal(price),
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
+            "client_order_id": client_id,
+            "reduce_only": True,
+        }
+
+        try:
+            response = self.rest.post("/portfolio/events/orders", json_data=payload)
+            order_id = response.get("order_id")
+
+            with self._lock:
+                entry.stop_order_id = order_id
+                entry.stop_client_order_id = client_id
+                self.order_id_to_client[order_id] = client_id
+                self.stop_order_ids.add(order_id)
+
+            self.trade_log.log_event(
+                "stop_escalated_to_ioc",
+                {
+                    "asset": entry.asset,
+                    "ticker": entry.ticker,
+                    "price": str(price),
+                    "count": str(count),
+                },
+            )
+            logger.info(
+                "Escalated to IOC stop %s %s @ %s (%s contracts)",
+                entry.asset,
+                entry.ticker,
+                price,
+                count,
+            )
+        except Exception:
+            logger.exception("Failed to place IOC stop for %s during escalation", entry.asset)
 
     def _place_ioc_stop_remaining(self, entry: EntryState, remaining_count: Decimal) -> None:
         """Place a single IOC reduce-only stop for current filled_count."""

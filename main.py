@@ -193,6 +193,7 @@ class WindowBot:
         self.ws.register_callback("fill", self._on_fill)
         self.ws.register_callback("settled", self._on_settled)
         self.ws.register_callback("determined", self._on_determined)
+        self.ws.register_callback("orderbook_delta", self._on_orderbook_delta)
 
         try:
             while not self._shutdown:
@@ -413,6 +414,30 @@ class WindowBot:
         ticker = msg.get("market_ticker") or msg.get("ticker")
         result = msg.get("result")
         logger.info("Determined: %s -> %s", ticker, result)
+
+    async def _on_orderbook_delta(self, data: dict[str, Any]) -> None:
+        """Handle orderbook updates. Check if market passed our stop levels."""
+        msg = data.get("msg", data)
+        ticker = msg.get("market_ticker") or msg.get("ticker")
+
+        # Extract current market prices from orderbook
+        yes_bids = msg.get("yes_bids", [])
+        yes_asks = msg.get("yes_asks", [])
+
+        if not yes_bids and not yes_asks:
+            return
+
+        # Get best prices
+        best_bid = float(yes_bids[0][0]) if yes_bids else 0.0
+        best_ask = float(yes_asks[0][0]) if yes_asks else 0.0
+        market_price = (best_bid + best_ask) / 2
+
+        # Check if any entry's stop levels have been passed
+        await asyncio.to_thread(
+            self.order_manager.check_stop_escalation,
+            ticker,
+            market_price,
+        )
 
     # ------------------------------------------------------------------
     # Helpers
