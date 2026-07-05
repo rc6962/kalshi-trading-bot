@@ -11,6 +11,7 @@ import json
 import logging
 import random
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -41,6 +42,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ALL_ASSETS = list(ASSET_TO_SERIES.keys())
+
+# EDT offset for July 2026 (UTC-4).  We use a fixed offset for display;
+# the actual trading logic is always in UTC.
+_EST_OFFSET = timedelta(hours=-4) if time.localtime().tm_isdst else timedelta(hours=-5)
+
+
+def _fmt_est(dt: datetime) -> str:
+    """Format a UTC datetime as HH:MM:SS Eastern time."""
+    est = dt + _EST_OFFSET
+    return est.strftime("%H:%M:%S")
 
 
 @dataclass
@@ -240,8 +251,8 @@ class WindowBot:
                     # Show countdown every 30s instead of silent sleep
                     while sleep_seconds > 10 and not self._shutdown:
                         logger.info(
-                            "Next window at %s — T-minus %.0fs",
-                            next_open.strftime("%H:%M:%S UTC"),
+                            "Next window at %s ET — T-minus %.0fs",
+                            _fmt_est(next_open),
                             sleep_seconds,
                         )
                         await asyncio.sleep(min(30, sleep_seconds - 10))
