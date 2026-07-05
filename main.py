@@ -231,6 +231,20 @@ class WindowBot:
         self.ws.register_callback("determined", self._on_determined)
         self.ws.register_callback("orderbook_delta", self._on_orderbook_delta)
 
+        # Immediately discover markets and subscribe so price data flows.
+        # This lets the bot detect 50/50 mid-window for early entry.
+        all_assets = list(set(self.config.yes_assets + self.config.no_assets))
+        try:
+            markets = await asyncio.to_thread(discover_markets, self.rest, all_assets)
+            if markets:
+                tickers = [m["ticker"] for m in markets.values()]
+                await self.ws.subscribe(tickers)
+                logger.info(
+                    "Subscribed to %d tickers on startup: %s", len(tickers), tickers
+                )
+        except Exception:
+            logger.debug("No active markets at startup — will retry in main loop")
+
         try:
             while not self._shutdown:
                 if self.risk_guard.kill_switch_active():
@@ -256,9 +270,10 @@ class WindowBot:
                 pre_open_buffer = 10
                 sleep_seconds = max(0, wait_seconds - pre_open_buffer)
                 if sleep_seconds > 30:
-                    # Show countdown + last known prices every 30s
+                    # Show countdown + last known prices every 30s.
+                    # Also probes for early market availability so the bot
+                    # doesn't wait for a boundary if markets already exist.
                     while sleep_seconds > 10 and not self._shutdown:
-                        # Build price status line
                         price_parts = []
                         for asset in sorted(
                             set(self.config.yes_assets + self.config.no_assets)
@@ -276,6 +291,36 @@ class WindowBot:
                             sleep_seconds,
                             price_status,
                         )
+
+                        # Peek for markets already active (mid-window start,
+                        # or early listing).  If found with >3 min left, enter.
+                        try:
+                            markets = await asyncio.to_thread(
+                                discover_markets,
+                                self.rest,
+                                list(
+                                    set(self.config.yes_assets + self.config.no_assets)
+                                ),
+                            )
+                            if markets:
+                                earliest_close = min(
+                                    _market_close_time(m)
+                                    for m in markets.values()
+                                    if _market_close_time(m)
+                                )
+                                if earliest_close:
+                                    left = (
+                                        earliest_close - datetime.now(timezone.utc)
+                                    ).total_seconds()
+                                    if left > 180:
+                                        logger.info(
+                                            "Markets discovered early — entering window"
+                                        )
+                                        await self._execute_window()
+                                        break
+                        except Exception:
+                            pass
+
                         await asyncio.sleep(min(30, sleep_seconds - 10))
                         sleep_seconds = max(
                             0,
