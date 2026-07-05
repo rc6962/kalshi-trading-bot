@@ -31,6 +31,15 @@ from kalshi.risk_guard import RiskGuard, estimated_max_loss_for_window
 from kalshi.ws_client import KalshiWebSocket
 from storage.trade_log import TradeLog
 
+
+class _EstFormatter(logging.Formatter):
+    """Custom formatter that shows timestamps in Eastern time."""
+
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
+        return _fmt_est(dt)
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -39,6 +48,11 @@ logging.basicConfig(
         logging.FileHandler("bot.log"),
     ],
 )
+# Replace the default formatter with our Eastern-time one
+for handler in logging.getLogger().handlers:
+    handler.setFormatter(
+        _EstFormatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
+    )
 logger = logging.getLogger(__name__)
 
 ALL_ASSETS = list(ASSET_TO_SERIES.keys())
