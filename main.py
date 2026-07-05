@@ -349,8 +349,12 @@ class WindowBot:
                 "Window close time set to %s", self.current_window_close.isoformat()
             )
         else:
-            logger.warning("Could not get close time — skipping window")
-            return
+            # Fallback: 15-min window from now
+            self.current_window_close = now + timedelta(minutes=15)
+            logger.info(
+                "Close time unavailable — using fallback %s",
+                self.current_window_close.isoformat(),
+            )
 
         # Tiny randomized wait so the book has a moment to form
         await asyncio.sleep(random.uniform(0.5, 1.5))
