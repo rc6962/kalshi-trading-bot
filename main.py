@@ -297,8 +297,10 @@ class WindowBot:
                     await self._execute_window()
                     continue
 
-                # Show prices every 30s so user knows data is flowing
-                if int(time.time()) % 30 == 0:
+                # Show live prices every 5s so user sees WS data flowing
+                _heartbeat_counter = getattr(self, "_heartbeat_counter", 0) + 1
+                self._heartbeat_counter = _heartbeat_counter
+                if _heartbeat_counter % 5 == 0:
                     parts = []
                     for asset in sorted(selected):
                         t = self._last_ticker.get(asset)
