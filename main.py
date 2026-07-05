@@ -49,8 +49,8 @@ _EST_OFFSET = timedelta(hours=-4) if time.localtime().tm_isdst else timedelta(ho
 
 
 def _fmt_est(dt: datetime) -> str:
-    """Format a UTC datetime as a readable Eastern time string.
-    Returns e.g. "Jul 5, 5:42am" or "Jul 5, 5:42pm".
+    """Format a UTC datetime as readable Eastern time.
+    Returns e.g. "July 5th 5:42am" or "December 25th 3:15pm".
     """
     est = dt + _EST_OFFSET
     hour = est.hour
@@ -59,7 +59,18 @@ def _fmt_est(dt: datetime) -> str:
         hour = 12
     elif hour > 12:
         hour -= 12
-    return f"{est.strftime('%b')} {est.day}, {hour}:{est.minute:02d}{ampm}"
+    day = est.day
+    if 11 <= day <= 13:
+        suffix = "th"
+    elif day % 10 == 1:
+        suffix = "st"
+    elif day % 10 == 2:
+        suffix = "nd"
+    elif day % 10 == 3:
+        suffix = "rd"
+    else:
+        suffix = "th"
+    return f"{est.strftime('%B')} {day}{suffix} {hour}:{est.minute:02d}{ampm}"
 
 
 @dataclass
