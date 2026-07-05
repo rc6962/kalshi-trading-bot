@@ -392,7 +392,6 @@ class OrderManager:
             "self_trade_prevention_type": "taker_at_cross",
             "client_order_id": client_order_id,
             "post_only": True,
-            "reduce_only": True,
         }
 
         try:
@@ -499,7 +498,6 @@ class OrderManager:
             "self_trade_prevention_type": "taker_at_cross",
             "client_order_id": client_id,
             "post_only": True,
-            "reduce_only": True,
         }
 
         try:
