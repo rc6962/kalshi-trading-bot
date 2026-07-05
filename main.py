@@ -428,6 +428,7 @@ class WindowBot:
 
         # Subscribe to tickers immediately so WS data starts flowing,
         # even if we skip this window due to prices.
+        # Re-subscribe WS to current tickers so prices stream in
         tickers = [e["ticker"] for e in planned_entries]
         try:
             await self.ws.subscribe(tickers)
@@ -435,7 +436,6 @@ class WindowBot:
             logger.exception("Failed to subscribe to tickers")
 
         # Seed price cache with REST orderbook so prices show immediately
-        # instead of waiting for first WS orderbook_delta message.
         for asset, market in self.current_markets.items():
             if (
                 asset not in self._asset_mid_prices
@@ -450,41 +450,9 @@ class WindowBot:
                 except Exception:
                     pass
 
-        # Risk checks
-        max_loss = estimated_max_loss_for_window(planned_entries)
-        if not self.risk_guard.check_balance(max_loss):
-            logger.warning("Insufficient balance for estimated max loss %.2f", max_loss)
-            return
+        entries_placed = False
 
-        if not self.risk_guard.check_exchange_status():
-            logger.warning("Exchange not active; skipping window")
-            return
-
-        # Re-subscribe WS to current tickers
-        tickers = [e["ticker"] for e in planned_entries]
-        try:
-            await self.ws.subscribe(tickers)
-        except Exception:
-            logger.exception("Failed to subscribe to tickers")
-
-        # Place entries — they either fill (via WS) or expire at market close.
-        # The bot stays live streaming Kalshi data the entire time.
-        self._skipped_close = None  # reset skip guard — we're entering
-        for plan in planned_entries:
-            try:
-                self.order_manager.place_entry(
-                    ticker=plan["ticker"],
-                    asset=plan["asset"],
-                    side=plan["side"],
-                    price=plan["price"],
-                    count=plan["count"],
-                    stop_width=self.config.stop_width,
-                )
-            except Exception:
-                logger.exception("Failed to place entry for %s", plan["asset"])
-
-        # Live status loop: display prices, positions, and countdown until T-60s
-        # (when unfilled take-profits get canceled).
+        # Live status/monitoring loop until T-60s
         if self.current_window_close:
             close_time = self.current_window_close
             while True:
@@ -493,6 +461,39 @@ class WindowBot:
 
                 if remaining <= 60:
                     break
+
+                # Check if prices are in 0.40-0.60 range — if so and we
+                # haven't entered yet, place orders now.
+                if not entries_placed:
+                    all_in_range = True
+                    for plan in planned_entries:
+                        asset = plan["asset"]
+                        mid = self._asset_mid_prices.get(asset)
+                        if (
+                            mid is None
+                            or mid < Decimal("0.40")
+                            or mid > Decimal("0.60")
+                        ):
+                            all_in_range = False
+                            break
+
+                    if all_in_range:
+                        logger.info("Prices in 0.40-0.60 range — placing entries")
+                        for plan in planned_entries:
+                            try:
+                                self.order_manager.place_entry(
+                                    ticker=plan["ticker"],
+                                    asset=plan["asset"],
+                                    side=plan["side"],
+                                    price=plan["price"],
+                                    count=plan["count"],
+                                    stop_width=self.config.stop_width,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to place entry for %s", plan["asset"]
+                                )
+                        entries_placed = True
 
                 # Build status line
                 parts = []
@@ -516,7 +517,8 @@ class WindowBot:
 
                 status = " | ".join(parts)
                 logger.info(
-                    "[%s] %s — T-%.0fs until TP cancel, window closes in %.0fs",
+                    "[%s] %s — T-%.0fs until TP cancel, window closes in %.0fs"
+                    + (" (waiting for 50/50)" if not entries_placed else ""),
                     self.current_window_id,
                     status,
                     max(0, remaining - 60),
@@ -528,8 +530,6 @@ class WindowBot:
         self.order_manager.cancel_all_take_profits()
         logger.info("Canceled take-profit orders — survivors ride to $1.00 settlement")
 
-        # The WS orderbook_delta callback continues monitoring stop/TP proximity
-        # for ALL assets and only escalates to IOC if BOTH limit stops are bypassed.
         logger.info(
             "=== Window %s — monitoring stops, waiting for settlement ===",
             self.current_window_id,
