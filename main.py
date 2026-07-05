@@ -311,29 +311,30 @@ class WindowBot:
         all_assets = list(set(self.config.yes_assets + self.config.no_assets))
         self.reentry_candidates.clear()
 
-        # Poll until Kalshi actually lists the active markets, up to 60 seconds
-        self.current_markets = await self._wait_for_active_markets(
-            all_assets, timeout_seconds=60
-        )
+        # Markets already detected via WS ticker — just need close_time metadata
         if not self.current_markets:
-            logger.warning(
-                "No active markets found for window %s after polling",
-                self.current_window_id,
-            )
-            self._skipped_close = None
+            logger.warning("No markets available for window %s", self.current_window_id)
             return
 
-        # Record the actual window close time from the market metadata
-        close_times = [
-            _market_close_time(m)
-            for m in self.current_markets.values()
-            if _market_close_time(m)
-        ]
+        # One REST call per window to get close_time for TP cancellation timing
+        close_times = []
+        for asset, market in list(self.current_markets.items()):
+            try:
+                md = await asyncio.to_thread(self.rest.get_market, market["ticker"])
+                ct = _market_close_time(md)
+                if ct:
+                    close_times.append(ct)
+            except Exception:
+                pass
+
         if close_times:
             self.current_window_close = min(close_times)
             logger.info(
                 "Window close time set to %s", self.current_window_close.isoformat()
             )
+        else:
+            logger.warning("Could not get close time — skipping window")
+            return
 
         # Tiny randomized wait so the book has a moment to form
         await asyncio.sleep(random.uniform(0.5, 1.5))
