@@ -333,7 +333,20 @@ class WindowBot:
                     await asyncio.sleep(10)
                 else:
                     # In a window — main loop is idle while WS handles monitoring.
-                    # Just sleep and let the window finish.
+                    # If the window close time has passed by >30s without a
+                    # settlement event, force-clear so we don't hang forever.
+                    if (
+                        self.current_window_close
+                        and (
+                            datetime.now(timezone.utc) - self.current_window_close
+                        ).total_seconds()
+                        > 30
+                    ):
+                        logger.warning(
+                            "Window close time %s passed — clearing stale markets",
+                            self.current_window_close,
+                        )
+                        self.current_markets = {}
                     await asyncio.sleep(10)
         except asyncio.CancelledError:
             logger.info("Bot loop cancelled")
