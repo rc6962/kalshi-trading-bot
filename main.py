@@ -256,12 +256,25 @@ class WindowBot:
                 pre_open_buffer = 10
                 sleep_seconds = max(0, wait_seconds - pre_open_buffer)
                 if sleep_seconds > 30:
-                    # Show countdown every 30s instead of silent sleep
+                    # Show countdown + last known prices every 30s
                     while sleep_seconds > 10 and not self._shutdown:
+                        # Build price status line
+                        price_parts = []
+                        for asset in sorted(
+                            set(self.config.yes_assets + self.config.no_assets)
+                        ):
+                            mid = self._asset_mid_prices.get(asset)
+                            if mid:
+                                price_parts.append(f"{asset}=${mid:.4f}")
+                            else:
+                                price_parts.append(f"{asset}=?")
+                        price_status = " | ".join(price_parts)
+
                         logger.info(
-                            "Next window at %s ET — T-minus %.0fs",
+                            "Next window at %s ET — T-minus %.0fs — %s",
                             _fmt_est(next_open),
                             sleep_seconds,
+                            price_status,
                         )
                         await asyncio.sleep(min(30, sleep_seconds - 10))
                         sleep_seconds = max(
