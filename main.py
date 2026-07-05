@@ -254,6 +254,7 @@ class WindowBot:
         self.ws.register_callback("settled", self._on_settled)
         self.ws.register_callback("determined", self._on_determined)
         self.ws.register_callback("orderbook_delta", self._on_orderbook_delta)
+        self.ws.register_callback("ticker", self._on_ticker)
 
         # Immediately discover markets and subscribe so price data flows.
         all_assets = list(set(self.config.yes_assets + self.config.no_assets))
@@ -663,31 +664,26 @@ class WindowBot:
         logger.info("Determined: %s -> %s", ticker, result)
 
     async def _on_orderbook_delta(self, data: dict[str, Any]) -> None:
-        """Handle orderbook updates. Monitor stop/TP proximity for all assets.
+        """Handle orderbook delta updates.  These are incremental changes
+        to single price levels — not useful for mid-price on their own.
+        Mid-prices come from the ticker channel instead."""
+        pass
 
-        For each active entry on this ticker:
-          - Stop escalation: only fires IoC if BOTH limit stops are bypassed
-          - TP proximity: logs when price nears the TP level
-        """
+    async def _on_ticker(self, data: dict[str, Any]) -> None:
+        """Handle ticker updates from WS.  Contains yes_bid_dollars and
+        yes_ask_dollars — the actual current market prices."""
         msg = data.get("msg", data)
         ticker = msg.get("market_ticker") or msg.get("ticker")
 
-        # Extract current market prices from orderbook
-        # WS sends yes_bids and no_bids only (no direct asks).
-        # YES ask is derived: yes_ask = 1 - best_no_bid
-        yes_bids = msg.get("yes_bids", [])
-        no_bids = msg.get("no_bids", [])
+        yes_bid = msg.get("yes_bid_dollars")
+        yes_ask = msg.get("yes_ask_dollars")
 
-        if not yes_bids and not no_bids:
+        if not yes_bid or not yes_ask:
             return
 
-        # Get best prices
-        best_bid = float(yes_bids[0][0]) if yes_bids else 0.0
-        best_no_bid = float(no_bids[0][0]) if no_bids else 0.0
-        best_ask = round(1.0 - best_no_bid, 4) if no_bids else best_bid
-        market_price = (best_bid + best_ask) / 2
+        market_price = (float(yes_bid) + float(yes_ask)) / 2
 
-        # Cache latest mid-price for re-entry checks
+        # Cache latest mid-price
         for asset, market in self.current_markets.items():
             if market.get("ticker") == ticker:
                 self._asset_mid_prices[asset] = Decimal(str(market_price))
@@ -700,14 +696,14 @@ class WindowBot:
             market_price,
         )
 
-        # TP proximity check — log when price is within 2¢ of take-profit level
+        # TP proximity check
         await asyncio.to_thread(
             self.order_manager.check_tp_proximity,
             ticker,
             market_price,
         )
 
-        # Re-entry check — if any asset had a TP fill and price returned to 50/50
+        # Re-entry check
         await self._check_reentry(ticker, market_price)
 
     # ------------------------------------------------------------------

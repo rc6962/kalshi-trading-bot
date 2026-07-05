@@ -15,13 +15,18 @@ from kalshi.auth import load_private_key, sign_request
 logger = logging.getLogger(__name__)
 
 # Channels we subscribe to
-DEFAULT_CHANNELS = ["fill", "market_lifecycle_v2", "orderbook_delta"]
+DEFAULT_CHANNELS = ["fill", "market_lifecycle_v2", "orderbook_delta", "ticker"]
 
 
 class KalshiWebSocket:
     """WebSocket client for Kalshi private/public channels."""
 
-    def __init__(self, ws_url: str | None = None, api_key_id: str | None = None, private_key_path: str | None = None):
+    def __init__(
+        self,
+        ws_url: str | None = None,
+        api_key_id: str | None = None,
+        private_key_path: str | None = None,
+    ):
         settings = get_settings()
         self.ws_url = ws_url or settings.kalshi_ws_url
         self.api_key_id = api_key_id or settings.kalshi_api_key_id
@@ -31,7 +36,9 @@ class KalshiWebSocket:
         self.websocket: websockets.WebSocketClientProtocol | None = None
         self.connected = False
         self.subscribed_tickers: list[str] = []
-        self.callbacks: dict[str, Callable[[dict[str, Any]], Coroutine[Any, Any, None] | None]] = {}
+        self.callbacks: dict[
+            str, Callable[[dict[str, Any]], Coroutine[Any, Any, None] | None]
+        ] = {}
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 10
         self._listen_task: asyncio.Task | None = None
@@ -65,7 +72,9 @@ class KalshiWebSocket:
             logger.exception("WebSocket connection failed")
             raise
 
-    async def unsubscribe(self, market_tickers: list[str], channels: list[str] | None = None) -> None:
+    async def unsubscribe(
+        self, market_tickers: list[str], channels: list[str] | None = None
+    ) -> None:
         """Unsubscribe from channels for given market tickers."""
         if not self.websocket or not self.connected:
             return
@@ -85,7 +94,9 @@ class KalshiWebSocket:
         except Exception:
             logger.exception("Failed to send unsubscribe message")
 
-    async def subscribe(self, market_tickers: list[str], channels: list[str] | None = None) -> None:
+    async def subscribe(
+        self, market_tickers: list[str], channels: list[str] | None = None
+    ) -> None:
         """Subscribe to channels for given market tickers."""
         if not self.websocket or not self.connected:
             raise RuntimeError("WebSocket not connected")
@@ -107,7 +118,9 @@ class KalshiWebSocket:
             },
         }
         await self.websocket.send(json.dumps(sub_msg))
-        logger.info("Subscribed to channels %s for %d tickers", channels, len(market_tickers))
+        logger.info(
+            "Subscribed to channels %s for %d tickers", channels, len(market_tickers)
+        )
 
     async def listen(self) -> None:
         """Main listen loop with reconnect."""
@@ -146,7 +159,12 @@ class KalshiWebSocket:
                 break
 
             wait = min(2**self._reconnect_attempts, 60)
-            logger.info("Reconnecting in %ds (attempt %d/%d)...", wait, self._reconnect_attempts, self._max_reconnect_attempts)
+            logger.info(
+                "Reconnecting in %ds (attempt %d/%d)...",
+                wait,
+                self._reconnect_attempts,
+                self._max_reconnect_attempts,
+            )
             # Use shutdown event so close() can interrupt the wait immediately
             try:
                 await asyncio.wait_for(self._shutdown_event.wait(), timeout=wait)
@@ -194,7 +212,9 @@ class KalshiWebSocket:
 
     async def _dispatch(self, data: dict[str, Any]) -> None:
         """Route message to registered callback based on type."""
-        msg_type = data.get("type") or data.get("msg", {}).get("type") or data.get("channel")
+        msg_type = (
+            data.get("type") or data.get("msg", {}).get("type") or data.get("channel")
+        )
         if not msg_type:
             logger.debug("WebSocket message with no type: %s", data)
             return
@@ -210,7 +230,10 @@ class KalshiWebSocket:
         else:
             logger.debug("No callback registered for message type: %s", msg_type)
 
-    def register_callback(self, msg_type: str, callback: Callable[[dict[str, Any]], Coroutine[Any, Any, None] | None]) -> None:
+    def register_callback(
+        self,
+        msg_type: str,
+        callback: Callable[[dict[str, Any]], Coroutine[Any, Any, None] | None],
+    ) -> None:
         """Register a callback for a message type."""
         self.callbacks[msg_type] = callback
-
