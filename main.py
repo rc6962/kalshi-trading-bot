@@ -211,6 +211,7 @@ class WindowBot:
             set()
         )  # assets whose TP filled, waiting for 50/50
         self._asset_mid_prices: dict[str, Decimal] = {}  # latest mid-price per asset
+        self._skip_until: datetime | None = None  # skip early probe until this time
 
     # ------------------------------------------------------------------
     # Main loop
@@ -295,32 +296,43 @@ class WindowBot:
 
                         # Peek for markets already active (mid-window start,
                         # or early listing).  If found with >3 min left, enter.
-                        try:
-                            markets = await asyncio.to_thread(
-                                discover_markets,
-                                self.rest,
-                                list(
-                                    set(self.config.yes_assets + self.config.no_assets)
-                                ),
-                            )
-                            if markets:
-                                earliest_close = min(
-                                    _market_close_time(m)
-                                    for m in markets.values()
-                                    if _market_close_time(m)
-                                )
-                                if earliest_close:
-                                    left = (
-                                        earliest_close - datetime.now(timezone.utc)
-                                    ).total_seconds()
-                                    if left > 180:
-                                        logger.info(
-                                            "Markets discovered early — entering window"
+                        # Only probe if we haven't already tried+skipped this window.
+                        if (
+                            self._skip_until
+                            and datetime.now(timezone.utc) < self._skip_until
+                        ):
+                            pass  # wait until boundary
+                        else:
+                            try:
+                                markets = await asyncio.to_thread(
+                                    discover_markets,
+                                    self.rest,
+                                    list(
+                                        set(
+                                            self.config.yes_assets
+                                            + self.config.no_assets
                                         )
-                                        entered_early = True
-                                        break
-                        except Exception:
-                            pass
+                                    ),
+                                )
+                                if markets:
+                                    earliest_close = min(
+                                        _market_close_time(m)
+                                        for m in markets.values()
+                                        if _market_close_time(m)
+                                    )
+                                    if earliest_close:
+                                        left = (
+                                            earliest_close - datetime.now(timezone.utc)
+                                        ).total_seconds()
+                                        if left > 180:
+                                            self._skip_until = None
+                                            logger.info(
+                                                "Markets discovered early — entering window"
+                                            )
+                                            entered_early = True
+                                            break
+                            except Exception:
+                                pass
 
                         await asyncio.sleep(min(30, sleep_seconds - 10))
                         sleep_seconds = max(
@@ -435,6 +447,7 @@ class WindowBot:
                     plan["asset"],
                     p,
                 )
+                self._skip_until = self._next_window_open()
                 return
 
         # Risk checks
