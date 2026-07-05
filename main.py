@@ -49,9 +49,17 @@ _EST_OFFSET = timedelta(hours=-4) if time.localtime().tm_isdst else timedelta(ho
 
 
 def _fmt_est(dt: datetime) -> str:
-    """Format a UTC datetime as HH:MM:SS Eastern time."""
+    """Format a UTC datetime as a readable Eastern time string.
+    Returns e.g. "Jul 5, 5:42am" or "Jul 5, 5:42pm".
+    """
     est = dt + _EST_OFFSET
-    return est.strftime("%H:%M:%S")
+    hour = est.hour
+    ampm = "am" if hour < 12 else "pm"
+    if hour == 0:
+        hour = 12
+    elif hour > 12:
+        hour -= 12
+    return f"{est.strftime('%b')} {est.day}, {hour}:{est.minute:02d}{ampm}"
 
 
 @dataclass
@@ -273,7 +281,7 @@ class WindowBot:
     async def _execute_window(self) -> None:
         """Run one trading window."""
         now = datetime.now(timezone.utc)
-        self.current_window_id = now.strftime("%Y%m%d%H%M")
+        self.current_window_id = _fmt_est(now)
         logger.info("=== Starting window %s ===", self.current_window_id)
 
         all_assets = list(set(self.config.yes_assets + self.config.no_assets))
