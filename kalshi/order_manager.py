@@ -40,6 +40,10 @@ class EntryState:
     order_id: str | None = None
     stop_order_id: str | None = None
     stop_client_order_id: str | None = None
+    tp_order_id: str | None = None
+    tp_client_order_id: str | None = None
+    tp_price: Decimal | None = None
+    tp_filled: bool = False
 
 
 class OrderManager:
@@ -53,6 +57,7 @@ class OrderManager:
         self.settled_tickers: set[str] = set()
         self.entry_order_ids: set[str] = set()  # track all entry order_ids
         self.stop_order_ids: set[str] = set()   # track all stop order_ids
+        self.tp_order_ids: set[str] = set()    # track all take-profit order_ids
         self.stop_to_parent_entry_price: dict[str, Decimal] = {}  # stop_order_id -> entry_price
         self.settings = get_settings()
         self._lock = threading.Lock()  # Protect shared state from concurrent access
@@ -165,7 +170,8 @@ class OrderManager:
         )
 
         if entry.filled_count > Decimal("0"):
-            self._place_ioc_stop(entry)
+            self._place_stop_order(entry)
+            self._place_take_profit_order(entry)
 
     def on_stop_fill(
             self,
@@ -219,6 +225,46 @@ class OrderManager:
         )
         logger.info("Stop filled: %s %s %s contracts @ %s (side=%s)", asset, ticker, fill_count, fill_price, fill_side)
 
+    def on_tp_fill(
+        self,
+        order_id: str | None,
+        client_order_id: str | None,
+        fill_price: str,
+        fill_count: str,
+        fill_side: str = "taker",
+    ) -> None:
+        """Handle a take-profit fill event."""
+        asset = "unknown"
+        ticker = "unknown"
+        side = "unknown"
+        parent_entry_client_order_id = None
+
+        with self._lock:
+            for entry in self.entries.values():
+                if entry.tp_client_order_id == client_order_id:
+                    asset = entry.asset
+                    ticker = entry.ticker
+                    side = entry.side
+                    parent_entry_client_order_id = entry.client_order_id
+                    entry.tp_filled = True
+                    break
+
+        self.trade_log.log_event(
+            "take_profit_fill",
+            {
+                "asset": asset,
+                "ticker": ticker,
+                "side": side,
+                "fill_price": fill_price,
+                "fill_count": fill_count,
+                "fill_side": fill_side,
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "parent_entry_client_order_id": parent_entry_client_order_id,
+            },
+        )
+        logger.info("Take-profit filled: %s %s %s contracts @ %s", asset, ticker, fill_count, fill_price)
+
     # ------------------------------------------------------------------
     # Stop placement
     # ------------------------------------------------------------------
@@ -241,15 +287,173 @@ class OrderManager:
             # Long NO: buy YES back. Price = entry + stop_width + buffer.
             return min(Decimal("0.99"), entry.entry_price + entry.stop_width + buffer)
 
-    def _place_ioc_stop(self, entry: EntryState) -> None:
-        """Place (or replace) a single IoC reduce-only stop for current filled_count."""
+    def _take_profit_price(self, entry: EntryState) -> Decimal:
+        """Compute take-profit price for the entry.
+
+        For a long YES position: sell at 0.98 (just below $1.00)
+        For a long NO position: buy at 0.02 (just above $0.00)
+        """
+        if entry.side == "bid":
+            # Long YES: sell to lock profit at 0.98
+            return Decimal("0.98")
+        else:
+            # Long NO: buy YES back at 0.02 (market YES goes to $0, we win)
+            return Decimal("0.02")
+
+    def _place_take_profit_order(self, entry: EntryState) -> None:
+        """Place a take-profit order to lock in profits."""
+        if entry.filled_count <= Decimal("0") or entry.tp_filled:
+            return
+
+        # Cancel existing TP if any
+        if entry.tp_order_id:
+            self._cancel_order(entry.tp_order_id, entry.tp_client_order_id)
+            with self._lock:
+                self.order_id_to_client.pop(entry.tp_order_id, None)
+                self.stop_order_ids.discard(entry.tp_order_id)
+
+        # Take-profit side is OPPOSITE of entry
+        # If we bought YES (bid), we sell YES (ask) to take profit
+        tp_side = "ask" if entry.side == "bid" else "bid"
+        tp_price = self._take_profit_price(entry)
+        count = entry.filled_count
+        client_order_id = str(uuid.uuid4())
+
+        payload = {
+            "ticker": entry.ticker,
+            "side": tp_side,
+            "count": _fmt_count(count),
+            "price": _fmt_decimal(tp_price),
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
+            "client_order_id": client_order_id,
+            "reduce_only": True,
+        }
+
+        try:
+            response = self.rest.post("/portfolio/events/orders", json_data=payload)
+            entry.tp_order_id = response.get("order_id")
+            entry.tp_client_order_id = client_order_id
+            entry.tp_price = tp_price
+            status = response.get("status", "")
+
+            if not entry.tp_order_id or status in ("canceled", "rejected"):
+                logger.warning(
+                    "Take-profit FAILED for %s %s — continuing without TP. Entry price: %s",
+                    entry.asset,
+                    entry.ticker,
+                    entry.entry_price,
+                )
+                entry.tp_order_id = None
+                return
+
+            with self._lock:
+                self.order_id_to_client[entry.tp_order_id] = client_order_id
+                self.tp_order_ids.add(entry.tp_order_id)
+
+            filled = Decimal(str(response.get("fill_count", "0")))
+            remaining = count - filled
+
+            self.trade_log.log_event(
+                "take_profit_placed",
+                {
+                    "asset": entry.asset,
+                    "ticker": entry.ticker,
+                    "side": tp_side,
+                    "price": str(tp_price),
+                    "count": str(count),
+                    "client_order_id": client_order_id,
+                    "order_id": entry.tp_order_id,
+                    "filled_count": str(filled),
+                    "remaining_count": str(remaining),
+                },
+            )
+            logger.info(
+                "Placed take-profit %s %s @ %s (%s contracts, filled %s, remaining %s)",
+                entry.asset,
+                entry.ticker,
+                tp_price,
+                count,
+                filled,
+                remaining,
+            )
+
+            if remaining > Decimal("0"):
+                logger.info(
+                    "Take-profit partial fill for %s %s — %s remaining unfilled",
+                    entry.asset,
+                    entry.ticker,
+                    remaining,
+                )
+
+        except Exception:
+            logger.exception("Failed to place take-profit for %s", entry.asset)
+
+    def _place_ioc_stop_remaining(self, entry: EntryState, remaining_count: Decimal) -> None:
+        """Place IOC order for remaining contracts after partial limit fill."""
+        if remaining_count <= Decimal("0"):
+            return
+
+        side = self._stop_side(entry)
+        price = self._stop_price(entry)
+        client_order_id = str(uuid.uuid4())
+
+        payload = {
+            "ticker": entry.ticker,
+            "side": side,
+            "count": _fmt_count(remaining_count),
+            "price": _fmt_decimal(price),
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
+            "client_order_id": client_order_id,
+            "reduce_only": True,
+        }
+
+        try:
+            response = self.rest.post("/portfolio/events/orders", json_data=payload)
+            stop_id = response.get("order_id")
+            filled = Decimal(str(response.get("fill_count", "0")))
+            retry_remaining = remaining_count - filled
+
+            logger.info(
+                "Placed IOC stop for remaining %s %s @ %s (%s contracts, filled %s, remaining %s)",
+                entry.asset,
+                entry.ticker,
+                price,
+                remaining_count,
+                filled,
+                retry_remaining,
+            )
+
+            if retry_remaining > Decimal("0"):
+                logger.critical(
+                    "IOC stop for remaining still left %s contracts unfilled for %s — potential exposure",
+                    retry_remaining,
+                    entry.ticker,
+                )
+                self.trade_log.log_event(
+                    "emergency_exposure",
+                    {
+                        "asset": entry.asset,
+                        "ticker": entry.ticker,
+                        "unfilled_count": str(retry_remaining),
+                        "stop_price": str(price),
+                    },
+                )
+        except Exception:
+            logger.exception("Failed to place IOC stop for remaining for %s", entry.asset)
+
+    def _place_stop_order(self, entry: EntryState) -> None:
+        """Place a limit stop-loss order first (to avoid taker fees).
+
+        If market passes our stop level, we'll escalate to IOC later.
+        """
         if entry.filled_count <= Decimal("0"):
             return
 
         # Cancel any existing stop before placing a new one
         if entry.stop_order_id:
             self._cancel_order(entry.stop_order_id, entry.stop_client_order_id)
-            # Clean up old mappings
             with self._lock:
                 self.order_id_to_client.pop(entry.stop_order_id, None)
                 self.stop_order_ids.discard(entry.stop_order_id)
@@ -259,6 +463,97 @@ class OrderManager:
         count = entry.filled_count
         client_order_id = str(uuid.uuid4())
 
+        # First try a limit order (GTC) to avoid taker fees
+        payload = {
+            "ticker": entry.ticker,
+            "side": side,
+            "count": _fmt_count(count),
+            "price": _fmt_decimal(price),
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
+            "client_order_id": client_order_id,
+            "post_only": True,  # Only post as maker, don't cross spread
+            "reduce_only": True,
+        }
+
+        try:
+            response = self.rest.post("/portfolio/events/orders", json_data=payload)
+            with self._lock:
+                entry.stop_order_id = response.get("order_id")
+                entry.stop_client_order_id = client_order_id
+            status = response.get("status", "")
+
+            if not entry.stop_order_id or status in ("canceled", "rejected"):
+                logger.warning(
+                    "Limit stop not posted for %s %s — placing IOC stop instead. Entry price: %s, Stop price: %s",
+                    entry.asset,
+                    entry.ticker,
+                    entry.entry_price,
+                    price,
+                )
+                # Fall back to IOC if limit couldn't be posted
+                self._place_ioc_stop(entry)
+                return
+
+            if entry.stop_order_id:
+                with self._lock:
+                    self.order_id_to_client[entry.stop_order_id] = client_order_id
+                    self.stop_order_ids.add(entry.stop_order_id)
+
+            filled = Decimal(str(response.get("fill_count", "0")))
+            remaining = count - filled
+
+            self.trade_log.log_event(
+                "stop_placed",
+                {
+                    "asset": entry.asset,
+                    "ticker": entry.ticker,
+                    "side": side,
+                    "price": str(price),
+                    "count": str(count),
+                    "client_order_id": client_order_id,
+                    "order_id": entry.stop_order_id,
+                    "type": "limit_maker",
+                    "entry_price": str(entry.entry_price),
+                    "filled_count": str(filled),
+                    "remaining_count": str(remaining),
+                },
+            )
+            logger.info(
+                "Placed limit stop %s %s @ %s (%s contracts, filled %s, remaining %s)",
+                entry.asset,
+                entry.ticker,
+                price,
+                count,
+                filled,
+                remaining,
+            )
+
+            # If limit had partial fill, place IOC for remaining
+            if remaining > Decimal("0"):
+                self._place_ioc_stop_remaining(entry, remaining)
+
+        except Exception:
+            logger.exception("Failed to place stop order for %s", entry.asset)
+
+    def _place_ioc_stop_remaining(self, entry: EntryState, remaining_count: Decimal) -> None:
+        """Place a single IOC reduce-only stop for current filled_count."""
+        if entry.filled_count <= Decimal("0"):
+            return
+
+        # Cancel any existing stop before placing a new one
+        if entry.stop_order_id:
+            self._cancel_order(entry.stop_order_id, entry.stop_client_order_id)
+            with self._lock:
+                self.order_id_to_client.pop(entry.stop_order_id, None)
+                self.stop_order_ids.discard(entry.stop_order_id)
+
+        side = self._stop_side(entry)
+        price = self._stop_price(entry)
+        count = entry.filled_count
+        client_order_id = str(uuid.uuid4())
+
+        # IOC order to aggressively get filled
         payload = {
             "ticker": entry.ticker,
             "side": side,
@@ -439,13 +734,15 @@ class OrderManager:
         return None
 
     def classify_order(self, order_id: str | None) -> str:
-        """Classify an order as 'entry', 'stop', or 'unknown'."""
+        """Classify an order as 'entry', 'stop', 'take_profit', or 'unknown'."""
         if not order_id:
             return "unknown"
         if order_id in self.entry_order_ids:
             return "entry"
         if order_id in self.stop_order_ids:
             return "stop"
+        if order_id in self.tp_order_ids:
+            return "take_profit"
         return "unknown"
 
     def _cancel_order(self, order_id: str | None, client_order_id: str | None) -> None:
@@ -468,6 +765,24 @@ class OrderManager:
         # Cancel orders outside the lock to avoid blocking during network calls
         for order_id, coid in to_cancel:
             self._cancel_order(order_id, coid)
+
+    def cancel_all_take_profits(self) -> None:
+        """Cancel all take-profit orders (used in last minute before settlement)."""
+        to_cancel = []
+        with self._lock:
+            for entry in list(self.entries.values()):
+                if entry.tp_order_id and not entry.tp_filled:
+                    to_cancel.append((entry.tp_order_id, entry.tp_client_order_id))
+                    self.tp_order_ids.discard(entry.tp_order_id)
+                    self.order_id_to_client.pop(entry.tp_order_id, None)
+                    entry.tp_order_id = None
+                    entry.tp_client_order_id = None
+                    entry.tp_filled = False
+                    entry.tp_price = None
+
+        for order_id, coid in to_cancel:
+            self._cancel_order(order_id, coid)
+            logger.info("Canceled take-profit order %s", order_id)
 
     def reset_window(self) -> None:
         """Clear tracked entries for a new window.

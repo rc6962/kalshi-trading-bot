@@ -381,6 +381,15 @@ class WindowBot:
                 str(fill_count),
                 "taker",
             )
+        elif role == "take_profit":
+            await asyncio.to_thread(
+                self.order_manager.on_tp_fill,
+                order_id,
+                client_order_id,
+                str(fill_price),
+                str(fill_count),
+                "taker",
+            )
         else:
             logger.warning("Unclassified fill: order_id=%s client_order_id=%s", order_id, client_order_id)
 
