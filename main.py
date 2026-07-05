@@ -451,6 +451,28 @@ class WindowBot:
             logger.warning("No planned entries for window %s", self.current_window_id)
             return
 
+        # Subscribe to tickers immediately so WS data starts flowing,
+        # even if we skip this window due to prices.
+        tickers = [e["ticker"] for e in planned_entries]
+        try:
+            await self.ws.subscribe(tickers)
+        except Exception:
+            logger.exception("Failed to subscribe to tickers")
+
+        # Re-entry check for price change — if we skipped this window
+        # before and prices have moved (cached via WS), try again.
+        if self.current_markets and self._last_skip_reason:
+            prices_now = ""
+            for asset in sorted(set(self.config.yes_assets + self.config.no_assets)):
+                m = self._asset_mid_prices.get(asset)
+                prices_now += f"{asset}={m or 0} "
+            if prices_now == self._last_skip_reason:
+                logger.info("Prices unchanged since last skip — skipping window")
+                return
+            else:
+                logger.info("Prices changed — re-checking entry conditions")
+                self._last_skip_reason = ""
+
         # Sanity check: skip if any entry price is too far from 50/50
         for plan in planned_entries:
             p = Decimal(str(plan["price"]))
