@@ -338,51 +338,57 @@ class WindowBot:
         # Tiny randomized wait so the book has a moment to form
         await asyncio.sleep(random.uniform(0.5, 1.5))
 
-        # Fetch orderbooks and build entry plan
+        # Fetch entry prices from WS ticker data (no REST calls needed)
         planned_entries = []
         for asset in self.config.yes_assets:
             market = self.current_markets.get(asset.upper())
-            if not market:
+            t = self._last_ticker.get(asset.upper())
+            if not market or not t:
                 continue
             try:
-                book = await asyncio.to_thread(
-                    self.orderbook.get_maker_prices,
-                    market["ticker"],
-                    Decimal(str(self.settings.entry_improvement)),
-                )
+                bid = float(t["yes_bid_dollars"])
+                ask = float(t["yes_ask_dollars"])
+                imp = self.settings.entry_improvement
+                if ask - bid >= 2 * imp:
+                    maker_bid = min(bid + imp, ask - imp)
+                else:
+                    maker_bid = bid
                 planned_entries.append(
                     {
                         "asset": asset.upper(),
                         "ticker": market["ticker"],
                         "side": "bid",
-                        "price": book["yes_bid_maker"],
+                        "price": Decimal(str(maker_bid)),
                         "count": Decimal(self.config.contracts),
                     }
                 )
             except Exception:
-                logger.exception("Failed to get orderbook for %s", asset)
+                logger.exception("Failed to get price for %s", asset)
 
         for asset in self.config.no_assets:
             market = self.current_markets.get(asset.upper())
-            if not market:
+            t = self._last_ticker.get(asset.upper())
+            if not market or not t:
                 continue
             try:
-                book = await asyncio.to_thread(
-                    self.orderbook.get_maker_prices,
-                    market["ticker"],
-                    Decimal(str(self.settings.entry_improvement)),
-                )
+                bid = float(t["yes_bid_dollars"])
+                ask = float(t["yes_ask_dollars"])
+                imp = self.settings.entry_improvement
+                if ask - bid >= 2 * imp:
+                    maker_ask = max(ask - imp, bid + imp)
+                else:
+                    maker_ask = ask
                 planned_entries.append(
                     {
                         "asset": asset.upper(),
                         "ticker": market["ticker"],
                         "side": "ask",
-                        "price": book["yes_ask_maker"],
+                        "price": Decimal(str(maker_ask)),
                         "count": Decimal(self.config.contracts),
                     }
                 )
             except Exception:
-                logger.exception("Failed to get orderbook for %s", asset)
+                logger.exception("Failed to get price for %s", asset)
 
         if not planned_entries:
             logger.warning("No planned entries for window %s", self.current_window_id)
