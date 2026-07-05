@@ -402,9 +402,13 @@ class WindowBot:
                 "Window close time set to %s", self.current_window_close.isoformat()
             )
 
-        # If we already skipped this exact window close time, don't re-check
+        # If we already skipped THIS exact window close time, don't re-check.
+        # Uses the fresh close time from discovery, not a stale one.
         if self._skipped_close and self.current_window_close == self._skipped_close:
-            logger.info("Already skipped this window — waiting for next")
+            logger.info(
+                "Already skipped close=%s — waiting for next window",
+                self.current_window_close,
+            )
             return
 
         # Tiny randomized wait so the book has a moment to form
@@ -467,6 +471,22 @@ class WindowBot:
             await self.ws.subscribe(tickers)
         except Exception:
             logger.exception("Failed to subscribe to tickers")
+
+        # Seed price cache with REST orderbook so prices show immediately
+        # instead of waiting for first WS orderbook_delta message.
+        for asset, market in self.current_markets.items():
+            if (
+                asset not in self._asset_mid_prices
+                or self._asset_mid_prices.get(asset) is None
+            ):
+                try:
+                    ob = await asyncio.to_thread(
+                        self.orderbook.get_parsed, market["ticker"]
+                    )
+                    mid = (ob["yes_bid"] + ob["yes_ask"]) / Decimal("2")
+                    self._asset_mid_prices[asset] = mid
+                except Exception:
+                    pass
 
         # Re-entry check for price change — if we skipped this window
         # before and prices have moved (cached via WS), try again.
