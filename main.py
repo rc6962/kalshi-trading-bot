@@ -273,6 +273,7 @@ class WindowBot:
                     # Show countdown + last known prices every 30s.
                     # Also probes for early market availability so the bot
                     # doesn't wait for a boundary if markets already exist.
+                    entered_early = False
                     while sleep_seconds > 10 and not self._shutdown:
                         price_parts = []
                         for asset in sorted(
@@ -316,7 +317,7 @@ class WindowBot:
                                         logger.info(
                                             "Markets discovered early — entering window"
                                         )
-                                        await self._execute_window()
+                                        entered_early = True
                                         break
                         except Exception:
                             pass
@@ -327,6 +328,10 @@ class WindowBot:
                             (next_open - datetime.now(timezone.utc)).total_seconds()
                             - 10,
                         )
+
+                    if entered_early:
+                        await self._execute_window()
+                        continue  # back to main loop — don't double-call
                 elif sleep_seconds > 0:
                     await asyncio.sleep(sleep_seconds)
 
