@@ -463,7 +463,21 @@ class WindowBot:
                 except Exception:
                     pass
 
-        entries_placed = False
+        # Place initial entry orders immediately on window open.
+        # No price gate — entry at whatever the orderbook shows.
+        # The 50/50 check only applies to re-entries (check_reentry).
+        for plan in planned_entries:
+            try:
+                self.order_manager.place_entry(
+                    ticker=plan["ticker"],
+                    asset=plan["asset"],
+                    side=plan["side"],
+                    price=plan["price"],
+                    count=plan["count"],
+                    stop_width=self.config.stop_width,
+                )
+            except Exception:
+                logger.exception("Failed to place entry for %s", plan["asset"])
 
         # Live status/monitoring loop until T-60s
         if self.current_window_close:
@@ -474,39 +488,6 @@ class WindowBot:
 
                 if remaining <= 60:
                     break
-
-                # Check if prices are in 0.40-0.60 range — if so and we
-                # haven't entered yet, place orders now.
-                if not entries_placed:
-                    all_in_range = True
-                    for plan in planned_entries:
-                        asset = plan["asset"]
-                        mid = self._asset_mid_prices.get(asset)
-                        if (
-                            mid is None
-                            or mid < Decimal("0.40")
-                            or mid > Decimal("0.60")
-                        ):
-                            all_in_range = False
-                            break
-
-                    if all_in_range:
-                        logger.info("Prices in 0.40-0.60 range — placing entries")
-                        for plan in planned_entries:
-                            try:
-                                self.order_manager.place_entry(
-                                    ticker=plan["ticker"],
-                                    asset=plan["asset"],
-                                    side=plan["side"],
-                                    price=plan["price"],
-                                    count=plan["count"],
-                                    stop_width=self.config.stop_width,
-                                )
-                            except Exception:
-                                logger.exception(
-                                    "Failed to place entry for %s", plan["asset"]
-                                )
-                        entries_placed = True
 
                 # Build status line
                 parts = []
@@ -530,8 +511,7 @@ class WindowBot:
 
                 status = " | ".join(parts)
                 logger.info(
-                    "[%s] %s — T-%.0fs until TP cancel, window closes in %.0fs"
-                    + (" (waiting for 50/50)" if not entries_placed else ""),
+                    "[%s] %s — T-%.0fs until TP cancel, window closes in %.0fs",
                     self.current_window_id,
                     status,
                     max(0, remaining - 60),
@@ -539,8 +519,7 @@ class WindowBot:
                 )
 
                 # Reconcile positions with Kalshi every loop
-                if entries_placed:
-                    await asyncio.to_thread(self.order_manager.reconcile_positions)
+                await asyncio.to_thread(self.order_manager.reconcile_positions)
 
                 await asyncio.sleep(1)
 
