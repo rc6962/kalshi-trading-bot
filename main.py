@@ -236,7 +236,7 @@ class WindowBot:
             set()
         )  # assets whose TP filled, waiting for 50/50
         self._asset_mid_prices: dict[str, Decimal] = {}  # latest mid-price per asset
-        self._skip_until: datetime | None = None  # skip early probe until this time
+        self._last_skip_reason: str = ""  # ticker-side:price that caused last skip
 
     # ------------------------------------------------------------------
     # Main loop
@@ -292,26 +292,21 @@ class WindowBot:
 
                 next_open = self._next_window_open()
                 wait_seconds = (next_open - datetime.now(timezone.utc)).total_seconds()
-                # Wake up 10 seconds before the expected open so we can catch the exact listing
                 pre_open_buffer = 10
                 sleep_seconds = max(0, wait_seconds - pre_open_buffer)
-                if sleep_seconds > 30:
-                    # Show countdown + last known prices every 30s.
-                    # Also probes for early market availability so the bot
-                    # doesn't wait for a boundary if markets already exist.
+                if sleep_seconds > 10:
                     entered_early = False
                     while sleep_seconds > 10 and not self._shutdown:
+                        # Show prices + countdown every 10s
                         price_parts = []
                         for asset in sorted(
                             set(self.config.yes_assets + self.config.no_assets)
                         ):
                             mid = self._asset_mid_prices.get(asset)
-                            if mid:
-                                price_parts.append(f"{asset}=${mid:.4f}")
-                            else:
-                                price_parts.append(f"{asset}=?")
+                            price_parts.append(
+                                f"{asset}=${mid:.4f}" if mid else f"{asset}=?"
+                            )
                         price_status = " | ".join(price_parts)
-
                         logger.info(
                             "Next window at %s ET — T-minus %.0fs — %s",
                             _fmt_est(next_open),
@@ -319,15 +314,9 @@ class WindowBot:
                             price_status,
                         )
 
-                        # Peek for markets already active (mid-window start,
-                        # or early listing).  If found with >3 min left, enter.
-                        # Only probe if we haven't already tried+skipped this window.
-                        if (
-                            self._skip_until
-                            and datetime.now(timezone.utc) < self._skip_until
-                        ):
-                            pass  # wait until boundary
-                        else:
+                        # Probe for markets every 10s if we haven't already
+                        # found them (current_markets is empty = not in a window)
+                        if not self.current_markets:
                             try:
                                 markets = await asyncio.to_thread(
                                     discover_markets,
@@ -350,16 +339,15 @@ class WindowBot:
                                             earliest_close - datetime.now(timezone.utc)
                                         ).total_seconds()
                                         if left > 180:
-                                            self._skip_until = None
                                             logger.info(
-                                                "Markets discovered early — entering window"
+                                                "Markets found — entering window"
                                             )
                                             entered_early = True
                                             break
                             except Exception:
                                 pass
 
-                        await asyncio.sleep(min(30, sleep_seconds - 10))
+                        await asyncio.sleep(min(10, sleep_seconds - 10))
                         sleep_seconds = max(
                             0,
                             (next_open - datetime.now(timezone.utc)).total_seconds()
@@ -368,7 +356,7 @@ class WindowBot:
 
                     if entered_early:
                         await self._execute_window()
-                        continue  # back to main loop — don't double-call
+                        continue
                 elif sleep_seconds > 0:
                     await asyncio.sleep(sleep_seconds)
 
@@ -472,7 +460,14 @@ class WindowBot:
                     plan["asset"],
                     p,
                 )
-                self._skip_until = self._next_window_open()
+                # Record the price snapshot so the probe won't retry until prices change
+                prices = ""
+                for asset in sorted(
+                    set(self.config.yes_assets + self.config.no_assets)
+                ):
+                    m = self._asset_mid_prices.get(asset)
+                    prices += f"{asset}={m or 0} "
+                self._last_skip_reason = prices
                 return
 
         # Risk checks
@@ -652,6 +647,13 @@ class WindowBot:
             result,
             settlement_price,
         )
+
+        # Clear this ticker from current_markets so the probe can
+        # discover the next window's market
+        for asset, market in list(self.current_markets.items()):
+            if market.get("ticker") == ticker:
+                del self.current_markets[asset]
+                break
 
     async def _on_determined(self, data: dict[str, Any]) -> None:
         """Handle market determination events."""
