@@ -13,6 +13,9 @@ from storage.trade_log import TradeLog
 
 logger = logging.getLogger(__name__)
 
+# Slippage buffer added to IoC stop price to ensure fill in fast markets
+_SLIPPAGE_BUFFER = Decimal("0.05")
+
 
 def _fmt_decimal(value: Decimal | float | str) -> str:
     d = Decimal(str(value))
@@ -221,9 +224,17 @@ class OrderManager:
         )
 
         if entry.filled_count > Decimal("0"):
-            # Place dual limit stops (maker) + take-profit (maker)
-            self._place_stop_order(entry)
+            # Take-profit order only (maker GTC post_only at 0.98/0.02).
+            # Stops are NOT pre-placed — they can't work on a CLOB.
+            # Instead, check_stop_escalation() monitors via WS and fires
+            # an aggressive IoC with slippage buffer when triggered.
             self._place_take_profit_order(entry)
+            logger.info(
+                "Stop monitoring active for %s %s — IoC if mkt reaches %.4f",
+                entry.asset,
+                entry.ticker,
+                self._stop_price(entry),
+            )
 
     def on_stop_fill(
         self,
@@ -656,17 +667,10 @@ class OrderManager:
             entry.stop_client_order_id_2 = None
 
     def check_stop_escalation(self, ticker: str, market_price: float) -> None:
-        """Check if market has passed stop levels. Only escalates to IOC when
-        BOTH limit-stops are bypassed (market gapped through both without fill).
+        """Check if market has passed the stop level. If so, fire an
+        aggressive IOC stop with slippage buffer to flatten the position.
 
-        Dual-stop ladder (example for long YES at $0.50, stop_width=$0.15):
-          Secondary stop at $0.37 — first defense, closer to entry
-          Primary stop at $0.35   — last resort
-
-        If only the secondary is passed, we cancel the stale secondary limit
-        and rely on the primary.  Only when market passes the primary AND the
-        secondary was already bypassed (or both are still active) do we escalate
-        to an aggressive IOC to flatten the position.
+        No pre-placed limit stops — monitoring-only via WS.
         """
         market_price = Decimal(str(market_price))
 
@@ -677,101 +681,38 @@ class OrderManager:
                 if entry.filled_count <= Decimal("0"):
                     continue
 
-                primary_stop = self._stop_price(entry)
-                secondary_stop = self._stop_price_2(entry)
-                secondary_bypassed = False
+                stop_level = self._stop_price(entry)
 
                 if entry.side == "bid":
-                    # Long YES: sell stops below entry price
-                    # Secondary ($0.37) is closer to entry — cancel if bypassed but
-                    # don't escalate yet; primary ($0.35) may still catch it.
-                    if market_price <= secondary_stop and entry.stop_order_id_2:
+                    # Long YES: stop is below entry (sell YES to flatten)
+                    if market_price <= stop_level:
                         logger.warning(
-                            "Secondary stop bypassed for %s (mkt=%s <= sec=%s) — "
-                            "canceling stale limit, relying on primary at %s",
+                            "Stop triggered for %s (mkt=%s <= stop=%s) — IoC",
                             entry.asset,
                             market_price,
-                            secondary_stop,
-                            primary_stop,
+                            stop_level,
                         )
-                        self._cancel_order(
-                            entry.stop_order_id_2, entry.stop_client_order_id_2
-                        )
-                        with self._lock:
-                            self.order_id_to_client.pop(entry.stop_order_id_2, None)
-                            self.stop_order_ids.discard(entry.stop_order_id_2)
-                            entry.stop_order_id_2 = None
-                            entry.stop_client_order_id_2 = None
-                        secondary_bypassed = True
-
-                    # If market also passed (or is at) primary, BOTH are bypassed → IoC
-                    if market_price <= primary_stop:
-                        if entry.stop_order_id:
-                            logger.warning(
-                                "BOTH stops bypassed for %s (mkt=%s <= pri=%s) — escalating to IOC",
-                                entry.asset,
-                                market_price,
-                                primary_stop,
-                            )
-                            self._escalate_to_ioc(entry)
-                        elif secondary_bypassed:
-                            logger.warning(
-                                "BOTH stops bypassed for %s (secondary canceled, "
-                                "primary gone) — escalating to IOC",
-                                entry.asset,
-                            )
-                            self._escalate_to_ioc(entry)
-
+                        self._escalate_to_ioc(entry)
                 else:
-                    # Long NO: buy stops above entry price (mirror logic)
-                    if market_price >= secondary_stop and entry.stop_order_id_2:
+                    # Long NO: stop is above entry (buy YES to flatten)
+                    if market_price >= stop_level:
                         logger.warning(
-                            "Secondary stop bypassed for %s (mkt=%s >= sec=%s) — "
-                            "canceling stale limit, relying on primary at %s",
+                            "Stop triggered for %s (mkt=%s >= stop=%s) — IoC",
                             entry.asset,
                             market_price,
-                            secondary_stop,
-                            primary_stop,
+                            stop_level,
                         )
-                        self._cancel_order(
-                            entry.stop_order_id_2, entry.stop_client_order_id_2
-                        )
-                        with self._lock:
-                            self.order_id_to_client.pop(entry.stop_order_id_2, None)
-                            self.stop_order_ids.discard(entry.stop_order_id_2)
-                            entry.stop_order_id_2 = None
-                            entry.stop_client_order_id_2 = None
-                        secondary_bypassed = True
-
-                    if market_price >= primary_stop:
-                        if entry.stop_order_id:
-                            logger.warning(
-                                "BOTH stops bypassed for %s (mkt=%s >= pri=%s) — escalating to IOC",
-                                entry.asset,
-                                market_price,
-                                primary_stop,
-                            )
-                            self._escalate_to_ioc(entry)
-                        elif secondary_bypassed:
-                            logger.warning(
-                                "BOTH stops bypassed for %s (secondary canceled, "
-                                "primary gone) — escalating to IOC",
-                                entry.asset,
-                            )
-                            self._escalate_to_ioc(entry)
+                        self._escalate_to_ioc(entry)
 
     def _escalate_to_ioc(self, entry: EntryState) -> None:
-        """Place an aggressive IOC stop as last resort when BOTH limit stops
-        have been bypassed (market gapped through without filling either).
+        """Place an aggressive IOC stop with slippage buffer to flatten
+        the position.  No pre-placed limit stops — this fires only when
+        the market reaches the stop level."""
 
-        Keeps the existing limit stops LIVE as a backup — if the market reverses
-        they may catch the position at a better price.  Once the IOC fills,
-        `on_stop_fill()` will clean up the limit stops and take-profit.
-        """
-
-        # Place IOC for full filled count
+        # Apply slippage buffer to ensure fill: 5¢ more aggressive
         side = self._stop_side(entry)
         price = self._stop_price(entry)
+        price = price - _SLIPPAGE_BUFFER if side == "ask" else price + _SLIPPAGE_BUFFER
         count = entry.filled_count
         client_id = str(uuid.uuid4())
 
