@@ -17,7 +17,11 @@ from pathlib import Path
 from typing import Any
 
 from config.settings import get_settings
-from kalshi.market_discovery import ASSET_TO_SERIES, _market_close_time, discover_markets
+from kalshi.market_discovery import (
+    ASSET_TO_SERIES,
+    _market_close_time,
+    discover_markets,
+)
 from kalshi.order_manager import OrderManager
 from kalshi.orderbook import OrderbookClient
 from kalshi.rest_client import KalshiRestClient
@@ -48,12 +52,16 @@ class BotConfig:
     live_mode: bool
 
 
-def _multi_select(prompt: str, options: list[str], defaults: list[str] | None = None) -> list[str]:
+def _multi_select(
+    prompt: str, options: list[str], defaults: list[str] | None = None
+) -> list[str]:
     print(f"\n{prompt}")
     for i, opt in enumerate(options, 1):
         marker = " [default]" if defaults and opt in defaults else ""
         print(f"  {i}. {opt}{marker}")
-    print("Enter numbers separated by commas (e.g., 1,2), or 'all', or press Enter for defaults.")
+    print(
+        "Enter numbers separated by commas (e.g., 1,2), or 'all', or press Enter for defaults."
+    )
     raw = input("> ").strip()
     if not raw:
         return defaults or []
@@ -111,14 +119,18 @@ def interactive_startup() -> BotConfig:
 
     overlap = set(yes_assets) & set(no_assets)
     if overlap:
-        print(f"\nWARNING: {overlap} selected for BOTH YES and NO. This flattens exposure on the same ticker.")
+        print(
+            f"\nWARNING: {overlap} selected for BOTH YES and NO. This flattens exposure on the same ticker."
+        )
         ok = input("Continue anyway? (yes/no): ").strip().lower()
         if ok != "yes":
             sys.exit(0)
 
     settings = get_settings()
     contracts = _prompt_int("Contracts per side, per asset", settings.default_contracts)
-    stop_width = _prompt_decimal("Stop-loss width in dollars", Decimal(str(settings.default_stop_width)))
+    stop_width = _prompt_decimal(
+        "Stop-loss width in dollars", Decimal(str(settings.default_stop_width))
+    )
     daily_loss_cap = _prompt_float("Daily loss cap (0 to disable)", 0.0)
 
     print("\nLive trading confirmation:")
@@ -175,6 +187,10 @@ class WindowBot:
         self.current_window_id: str = ""
         self.current_window_close: datetime | None = None
         self._shutdown = False
+        self.reentry_candidates: set[str] = (
+            set()
+        )  # assets whose TP filled, waiting for 50/50
+        self._asset_mid_prices: dict[str, Decimal] = {}  # latest mid-price per asset
 
     # ------------------------------------------------------------------
     # Main loop
@@ -202,7 +218,9 @@ class WindowBot:
                     await asyncio.sleep(5)
                     continue
 
-                if self.risk_guard.check_daily_loss(self._daily_realized_pnl(), self.config.daily_loss_cap):
+                if self.risk_guard.check_daily_loss(
+                    self._daily_realized_pnl(), self.config.daily_loss_cap
+                ):
                     logger.warning("Daily loss cap reached. Halting new entries.")
                     await asyncio.sleep(60)
                     continue
@@ -218,7 +236,11 @@ class WindowBot:
                 pre_open_buffer = 10
                 sleep_seconds = max(0, wait_seconds - pre_open_buffer)
                 if sleep_seconds > 0:
-                    logger.info("Next window expected at %s (sleeping %.0fs)", next_open.isoformat(), sleep_seconds)
+                    logger.info(
+                        "Next window expected at %s (sleeping %.0fs)",
+                        next_open.isoformat(),
+                        sleep_seconds,
+                    )
                     await asyncio.sleep(sleep_seconds)
 
                 await self._execute_window()
@@ -234,11 +256,17 @@ class WindowBot:
         logger.info("=== Starting window %s ===", self.current_window_id)
 
         all_assets = list(set(self.config.yes_assets + self.config.no_assets))
+        self.reentry_candidates.clear()
 
         # Poll until Kalshi actually lists the active markets, up to 60 seconds
-        self.current_markets = await self._wait_for_active_markets(all_assets, timeout_seconds=60)
+        self.current_markets = await self._wait_for_active_markets(
+            all_assets, timeout_seconds=60
+        )
         if not self.current_markets:
-            logger.warning("No active markets found for window %s after polling", self.current_window_id)
+            logger.warning(
+                "No active markets found for window %s after polling",
+                self.current_window_id,
+            )
             return
 
         # Record the actual window close time from the market metadata
@@ -249,7 +277,9 @@ class WindowBot:
         ]
         if close_times:
             self.current_window_close = min(close_times)
-            logger.info("Window close time set to %s", self.current_window_close.isoformat())
+            logger.info(
+                "Window close time set to %s", self.current_window_close.isoformat()
+            )
 
         # Tiny randomized wait so the book has a moment to form
         await asyncio.sleep(random.uniform(0.5, 1.5))
@@ -266,13 +296,15 @@ class WindowBot:
                     market["ticker"],
                     self.settings.entry_improvement,
                 )
-                planned_entries.append({
-                    "asset": asset.upper(),
-                    "ticker": market["ticker"],
-                    "side": "bid",
-                    "price": book["yes_bid_maker"],
-                    "count": Decimal(self.config.contracts),
-                })
+                planned_entries.append(
+                    {
+                        "asset": asset.upper(),
+                        "ticker": market["ticker"],
+                        "side": "bid",
+                        "price": book["yes_bid_maker"],
+                        "count": Decimal(self.config.contracts),
+                    }
+                )
             except Exception:
                 logger.exception("Failed to get orderbook for %s", asset)
 
@@ -286,13 +318,15 @@ class WindowBot:
                     market["ticker"],
                     self.settings.entry_improvement,
                 )
-                planned_entries.append({
-                    "asset": asset.upper(),
-                    "ticker": market["ticker"],
-                    "side": "ask",
-                    "price": book["yes_ask_maker"],
-                    "count": Decimal(self.config.contracts),
-                })
+                planned_entries.append(
+                    {
+                        "asset": asset.upper(),
+                        "ticker": market["ticker"],
+                        "side": "ask",
+                        "price": book["yes_ask_maker"],
+                        "count": Decimal(self.config.contracts),
+                    }
+                )
             except Exception:
                 logger.exception("Failed to get orderbook for %s", asset)
 
@@ -317,7 +351,8 @@ class WindowBot:
         except Exception:
             logger.exception("Failed to subscribe to tickers")
 
-        # Place entries
+        # Place entries — they either fill (via WS) or expire at market close.
+        # The bot stays live streaming Kalshi data the entire time.
         for plan in planned_entries:
             try:
                 self.order_manager.place_entry(
@@ -331,21 +366,28 @@ class WindowBot:
             except Exception:
                 logger.exception("Failed to place entry for %s", plan["asset"])
 
-        # Wait until ~3 minutes before this window's actual close, then cancel unfilled entries
+        # Cancel any unfilled take-profits at T-60s so winners ride to $1.00
+        # settlement rather than clipping profit at the 0.98/0.02 TP price.
         if self.current_window_close:
-            seconds_to_close = (self.current_window_close - datetime.now(timezone.utc)).total_seconds()
-        else:
-            seconds_to_close = 15 * 60  # fallback
-        cancel_seconds_before = 180
-        wait_until_cancel = max(0, seconds_to_close - cancel_seconds_before)
-        logger.info("Waiting %.0fs before canceling unfilled entries", wait_until_cancel)
-        await asyncio.sleep(wait_until_cancel)
+            remaining = (
+                self.current_window_close - datetime.now(timezone.utc)
+            ).total_seconds()
+            tp_wait = max(0, remaining - 60)
+            if tp_wait > 0:
+                logger.info(
+                    "Waiting %.0fs before canceling take-profits at T-60s", tp_wait
+                )
+                await asyncio.sleep(tp_wait)
 
-        self.order_manager.cancel_all_entries()
-        logger.info("Canceled unfilled entry orders")
+        self.order_manager.cancel_all_take_profits()
+        logger.info("Canceled take-profit orders — survivors ride to $1.00 settlement")
 
-        # Hold remaining positions to expiry; state is cleared on settlement events
-        logger.info("=== Window %s entry phase complete ===", self.current_window_id)
+        # The WS orderbook_delta callback continues monitoring stop/TP proximity
+        # for ALL assets and only escalates to IOC if BOTH limit stops are bypassed.
+        logger.info(
+            "=== Window %s — monitoring stops, waiting for settlement ===",
+            self.current_window_id,
+        )
 
     # ------------------------------------------------------------------
     # WebSocket callbacks
@@ -356,8 +398,14 @@ class WindowBot:
         msg = data.get("msg", data)
         order_id = msg.get("order_id")
         client_order_id = msg.get("client_order_id")
-        fill_price = msg.get("yes_price_dollars") or msg.get("price_dollars") or msg.get("fill_price_dollars")
+        fill_price = (
+            msg.get("yes_price_dollars")
+            or msg.get("price_dollars")
+            or msg.get("fill_price_dollars")
+        )
         fill_count = msg.get("count_fp") or msg.get("fill_count")
+
+        ticker = msg.get("market_ticker") or msg.get("ticker")
 
         if not fill_price or not fill_count:
             logger.debug("Fill message missing price/count: %s", data)
@@ -382,6 +430,17 @@ class WindowBot:
                 str(fill_count),
                 "taker",
             )
+            # Stop filled — position closed at a loss. Mark as re-entry eligible
+            # so if the whole session closes and returns to 50/50, we can retry.
+            if ticker:
+                for asset, market in self.current_markets.items():
+                    if market.get("ticker") == ticker:
+                        self.reentry_candidates.add(asset)
+                        logger.info(
+                            "Stop filled for %s — added to re-entry candidates",
+                            asset,
+                        )
+                        break
         elif role == "take_profit":
             await asyncio.to_thread(
                 self.order_manager.on_tp_fill,
@@ -391,15 +450,31 @@ class WindowBot:
                 str(fill_count),
                 "taker",
             )
+            # TP filled — position closed with profit. Mark as re-entry eligible.
+            if ticker:
+                for asset, market in self.current_markets.items():
+                    if market.get("ticker") == ticker:
+                        self.reentry_candidates.add(asset)
+                        logger.info(
+                            "TP filled for %s — added to re-entry candidates",
+                            asset,
+                        )
+                        break
         else:
-            logger.warning("Unclassified fill: order_id=%s client_order_id=%s", order_id, client_order_id)
+            logger.warning(
+                "Unclassified fill: order_id=%s client_order_id=%s",
+                order_id,
+                client_order_id,
+            )
 
     async def _on_settled(self, data: dict[str, Any]) -> None:
         """Handle market settlement events."""
         msg = data.get("msg", data)
         ticker = msg.get("market_ticker") or msg.get("ticker")
         result = msg.get("result")
-        settlement_price = msg.get("settlement_value") or msg.get("settlement_price_dollars")
+        settlement_price = msg.get("settlement_value") or msg.get(
+            "settlement_price_dollars"
+        )
         logger.info("Settlement: %s -> %s @ %s", ticker, result, settlement_price)
         await asyncio.to_thread(
             self.order_manager.on_settlement,
@@ -416,7 +491,12 @@ class WindowBot:
         logger.info("Determined: %s -> %s", ticker, result)
 
     async def _on_orderbook_delta(self, data: dict[str, Any]) -> None:
-        """Handle orderbook updates. Check if market passed our stop levels."""
+        """Handle orderbook updates. Monitor stop/TP proximity for all assets.
+
+        For each active entry on this ticker:
+          - Stop escalation: only fires IoC if BOTH limit stops are bypassed
+          - TP proximity: logs when price nears the TP level
+        """
         msg = data.get("msg", data)
         ticker = msg.get("market_ticker") or msg.get("ticker")
 
@@ -432,12 +512,28 @@ class WindowBot:
         best_ask = float(yes_asks[0][0]) if yes_asks else 0.0
         market_price = (best_bid + best_ask) / 2
 
-        # Check if any entry's stop levels have been passed
+        # Cache latest mid-price for re-entry checks
+        for asset, market in self.current_markets.items():
+            if market.get("ticker") == ticker:
+                self._asset_mid_prices[asset] = Decimal(str(market_price))
+                break
+
+        # Route to OrderManager: check stop levels and TP proximity
         await asyncio.to_thread(
             self.order_manager.check_stop_escalation,
             ticker,
             market_price,
         )
+
+        # TP proximity check — log when price is within 2¢ of take-profit level
+        await asyncio.to_thread(
+            self.order_manager.check_tp_proximity,
+            ticker,
+            market_price,
+        )
+
+        # Re-entry check — if any asset had a TP fill and price returned to 50/50
+        await self._check_reentry(ticker, market_price)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -474,6 +570,87 @@ class WindowBot:
         if minutes_to_add == 15:
             minutes_to_add = 0
         return aligned + timedelta(minutes=minutes_to_add, seconds=2)
+
+    async def _check_reentry(self, ticker: str, market_price: float) -> None:
+        """Check whether ALL session assets have TP'd and returned to 50/50.
+        If so, re-enter all of them together with their partner assets.
+
+        Only re-enters if there are >3 minutes until expiry to give the
+        new positions time to work.
+        """
+        session_assets = list(set(self.config.yes_assets + self.config.no_assets))
+        if not session_assets:
+            return
+
+        # Must be >3 minutes remaining to give new positions time to work
+        if self.current_window_close:
+            remaining = (
+                self.current_window_close - datetime.now(timezone.utc)
+            ).total_seconds()
+            if remaining < 180:
+                self.reentry_candidates.clear()
+                return
+
+        # Check if ALL session assets have TP'd and all are near 50/50
+        for asset in session_assets:
+            if asset not in self.reentry_candidates:
+                return  # not all TP'd yet — keep waiting
+
+        all_near_50 = True
+        for asset in session_assets:
+            mid = self._asset_mid_prices.get(asset)
+            if mid is None or mid < Decimal("0.47") or mid > Decimal("0.53"):
+                all_near_50 = False
+                break
+
+        if not all_near_50:
+            return
+
+        # ALL session assets are TP'd and all are near 50/50 — re-enter everything
+        logger.info(
+            "=== Session re-entry triggered — all assets near 50/50: %s ===",
+            session_assets,
+        )
+        self.reentry_candidates.clear()
+
+        for asset in session_assets:
+            market = self.current_markets.get(asset)
+            if not market:
+                continue
+
+            try:
+                book = await asyncio.to_thread(
+                    self.orderbook.get_maker_prices,
+                    market["ticker"],
+                    self.settings.entry_improvement,
+                )
+            except Exception:
+                logger.exception("Failed to get orderbook for re-entry of %s", asset)
+                continue
+
+            if asset in self.config.yes_assets:
+                self.order_manager.place_entry(
+                    ticker=market["ticker"],
+                    asset=asset,
+                    side="bid",
+                    price=book["yes_bid_maker"],
+                    count=Decimal(self.config.contracts),
+                )
+            if asset in self.config.no_assets:
+                self.order_manager.place_entry(
+                    ticker=market["ticker"],
+                    asset=asset,
+                    side="ask",
+                    price=book["yes_ask_maker"],
+                    count=Decimal(self.config.contracts),
+                )
+
+            logger.info(
+                "Re-entry orders placed for %s — bid=%s ask=%s",
+                asset,
+                book.get("yes_bid_maker"),
+                book.get("yes_ask_maker"),
+            )
 
     def _daily_realized_pnl(self) -> float:
         """Calculate accurate realized PnL from completed trades today.
@@ -529,7 +706,9 @@ class WindowBot:
                     "entry_price": float(fill_event.get("entry_price", "0.0")),
                     "total_filled": Decimal("0"),
                 }
-            entries_by_client_id[client_id]["total_filled"] += Decimal(fill_event.get("fill_count", "0"))
+            entries_by_client_id[client_id]["total_filled"] += Decimal(
+                fill_event.get("fill_count", "0")
+            )
 
         # Pre-bucket entries by ticker for O(1) lookup during settlement
         entries_by_ticker: dict[str, list[str]] = defaultdict(list)
@@ -600,15 +779,23 @@ def main() -> None:
     parser.add_argument("--no", help="Comma-separated NO assets (overrides prompt)")
     parser.add_argument("--contracts", type=int, help="Contracts per side")
     parser.add_argument("--stop-width", type=float, help="Stop width in dollars")
-    parser.add_argument("--daily-loss-cap", type=float, default=0.0, help="Daily loss cap")
-    parser.add_argument("--live", action="store_true", help="Skip live confirmation prompt")
+    parser.add_argument(
+        "--daily-loss-cap", type=float, default=0.0, help="Daily loss cap"
+    )
+    parser.add_argument(
+        "--live", action="store_true", help="Skip live confirmation prompt"
+    )
     args = parser.parse_args()
 
     if args.yes is not None:
         yes_assets = [a.strip().upper() for a in args.yes.split(",") if a.strip()]
         no_assets = [a.strip().upper() for a in (args.no or "").split(",") if a.strip()]
         contracts = args.contracts or get_settings().default_contracts
-        stop_width = Decimal(str(args.stop_width)) if args.stop_width else Decimal(str(get_settings().default_stop_width))
+        stop_width = (
+            Decimal(str(args.stop_width))
+            if args.stop_width
+            else Decimal(str(get_settings().default_stop_width))
+        )
         if not args.live:
             print("--live flag required when using CLI args")
             sys.exit(1)
