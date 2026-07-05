@@ -424,7 +424,7 @@ class WindowBot:
         # Sanity check: skip if any entry price is too far from 50/50
         for plan in planned_entries:
             p = Decimal(str(plan["price"]))
-            if p < Decimal("0.30") or p > Decimal("0.70"):
+            if p < Decimal("0.40") or p > Decimal("0.60"):
                 logger.warning(
                     "%s entry price %.4f too far from 50/50 — skipping window",
                     plan["asset"],
