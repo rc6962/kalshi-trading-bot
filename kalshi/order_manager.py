@@ -221,19 +221,9 @@ class OrderManager:
         )
 
         if entry.filled_count > Decimal("0"):
-            # Take-profit order at 0.98/0.02 (maker, locks in profit).
-            # Stop-loss is NOT pre-placed — it can't work as a maker limit
-            # on a CLOB because the stop price ($0.35) crosses current market
-            # ($0.50). Instead, check_stop_escalation() monitors via WS and
-            # fires an IoC stop when the market reaches the stop level.
+            # Place dual limit stops (maker) + take-profit (maker)
+            self._place_stop_order(entry)
             self._place_take_profit_order(entry)
-            logger.info(
-                "Stop monitoring active for %s %s — will IoC if mkt reaches %.4f/%.4f",
-                entry.asset,
-                entry.ticker,
-                self._stop_price(entry),
-                self._stop_price_2(entry),
-            )
 
     def on_stop_fill(
         self,
