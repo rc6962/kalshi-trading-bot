@@ -296,6 +296,20 @@ class WindowBot:
                 ):
                     await self._execute_window()
                     continue
+
+                # Show prices every 30s so user knows data is flowing
+                if int(time.time()) % 30 == 0:
+                    parts = []
+                    for asset in sorted(selected):
+                        t = self._last_ticker.get(asset)
+                        if t:
+                            bid = float(t["yes_bid_dollars"])
+                            ask = float(t["yes_ask_dollars"])
+                            parts.append(f"{asset}=${bid:.4f}/${ask:.4f}")
+                        else:
+                            parts.append(f"{asset}=?")
+                    logger.info("Live prices — %s", " | ".join(parts))
+
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             logger.info("Bot loop cancelled")
