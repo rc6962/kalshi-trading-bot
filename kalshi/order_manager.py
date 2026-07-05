@@ -96,6 +96,45 @@ class OrderManager:
 
         response = self.rest.post("/portfolio/events/orders", json_data=payload)
         order_id = response.get("order_id")
+        status = response.get("status", "")
+
+        if not order_id or status in ("canceled", "rejected"):
+            logger.warning(
+                "Entry %s %s %s NOT placed — API returned status=%s order_id=%s",
+                asset,
+                side,
+                ticker,
+                status,
+                order_id,
+            )
+            self.trade_log.log_event(
+                "entry_rejected",
+                {
+                    "asset": asset,
+                    "ticker": ticker,
+                    "side": side,
+                    "price": str(price),
+                    "count": str(count),
+                    "status": status,
+                    "response": response,
+                },
+            )
+            # Return a partial entry so the caller doesn't crash, but
+            # no order_id means it won't be tracked for fills
+            entry = EntryState(
+                client_order_id=client_order_id,
+                ticker=ticker,
+                asset=asset,
+                side=side,
+                entry_price=price,
+                requested_count=count,
+                remaining_count=count,
+                stop_width=stop_width,
+                order_id=None,
+            )
+            with self._lock:
+                self.entries[client_order_id] = entry
+            return entry
 
         entry = EntryState(
             client_order_id=client_order_id,
