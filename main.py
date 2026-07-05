@@ -673,15 +673,18 @@ class WindowBot:
         ticker = msg.get("market_ticker") or msg.get("ticker")
 
         # Extract current market prices from orderbook
+        # WS sends yes_bids and no_bids only (no direct asks).
+        # YES ask is derived: yes_ask = 1 - best_no_bid
         yes_bids = msg.get("yes_bids", [])
-        yes_asks = msg.get("yes_asks", [])
+        no_bids = msg.get("no_bids", [])
 
-        if not yes_bids and not yes_asks:
+        if not yes_bids and not no_bids:
             return
 
         # Get best prices
         best_bid = float(yes_bids[0][0]) if yes_bids else 0.0
-        best_ask = float(yes_asks[0][0]) if yes_asks else 0.0
+        best_no_bid = float(no_bids[0][0]) if no_bids else 0.0
+        best_ask = round(1.0 - best_no_bid, 4) if no_bids else best_bid
         market_price = (best_bid + best_ask) / 2
 
         # Cache latest mid-price for re-entry checks
