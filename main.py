@@ -288,6 +288,14 @@ class WindowBot:
                 # WS data drives everything — ticker/fill/lifecycle channels
                 # stream prices, fills, and market events in real-time.
                 # No REST polling needed.
+                selected = set(self.config.yes_assets + self.config.no_assets)
+                if (
+                    self.current_markets
+                    and not self.current_window_close
+                    and selected.issubset(self.current_markets.keys())
+                ):
+                    await self._execute_window()
+                    continue
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             logger.info("Bot loop cancelled")
@@ -612,22 +620,35 @@ class WindowBot:
         ):
             return
 
-        # Detect 15-min crypto markets by ticker prefix and auto-subscribe
+        # Detect 15-min crypto markets by ticker prefix — only for user-selected assets
         from kalshi.market_discovery import ASSET_TO_SERIES
 
+        selected = set(self.config.yes_assets + self.config.no_assets)
+        new_detected = False
         for asset, series in ASSET_TO_SERIES.items():
-            if ticker_str.startswith(series) and asset not in self.current_markets:
+            if (
+                asset in selected
+                and ticker_str.startswith(series)
+                and asset not in self.current_markets
+            ):
                 self.current_markets[asset] = {"ticker": ticker_str}
-                try:
-                    await self.ws.subscribe([ticker_str], ["orderbook_delta"])
-                    logger.info(
-                        "Auto-detected %s market: %s — subscribed to orderbook_delta",
-                        asset,
-                        ticker_str,
-                    )
-                except Exception:
-                    pass
+                new_detected = True
+                logger.info("Detected %s market: %s", asset, ticker_str)
                 break
+
+        # Subscribe to orderbook_delta for ALL detected tickers at once
+        # (subscribe replaces old tickers, so only call when we have a new one)
+        if new_detected:
+            ob_tickers = [m["ticker"] for m in self.current_markets.values()]
+            try:
+                await self.ws.subscribe(ob_tickers, ["orderbook_delta"])
+                logger.info(
+                    "Subscribed to orderbook_delta for %d markets: %s",
+                    len(ob_tickers),
+                    ob_tickers,
+                )
+            except Exception:
+                pass
 
         # Store raw ticker data
         for asset, market in self.current_markets.items():
