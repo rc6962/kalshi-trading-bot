@@ -421,6 +421,17 @@ class WindowBot:
             logger.warning("No planned entries for window %s", self.current_window_id)
             return
 
+        # Sanity check: skip if any entry price is too far from 50/50
+        for plan in planned_entries:
+            p = Decimal(str(plan["price"]))
+            if p < Decimal("0.30") or p > Decimal("0.70"):
+                logger.warning(
+                    "%s entry price %.4f too far from 50/50 — skipping window",
+                    plan["asset"],
+                    p,
+                )
+                return
+
         # Risk checks
         max_loss = estimated_max_loss_for_window(planned_entries)
         if not self.risk_guard.check_balance(max_loss):
