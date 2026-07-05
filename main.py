@@ -7,6 +7,7 @@ and holds survivors to expiry.
 
 import argparse
 import asyncio
+import json
 import logging
 import random
 import sys
@@ -235,12 +236,21 @@ class WindowBot:
                 # Wake up 10 seconds before the expected open so we can catch the exact listing
                 pre_open_buffer = 10
                 sleep_seconds = max(0, wait_seconds - pre_open_buffer)
-                if sleep_seconds > 0:
-                    logger.info(
-                        "Next window expected at %s (sleeping %.0fs)",
-                        next_open.isoformat(),
-                        sleep_seconds,
-                    )
+                if sleep_seconds > 30:
+                    # Show countdown every 30s instead of silent sleep
+                    while sleep_seconds > 10 and not self._shutdown:
+                        logger.info(
+                            "Next window at %s — T-minus %.0fs",
+                            next_open.strftime("%H:%M:%S UTC"),
+                            sleep_seconds,
+                        )
+                        await asyncio.sleep(min(30, sleep_seconds - 10))
+                        sleep_seconds = max(
+                            0,
+                            (next_open - datetime.now(timezone.utc)).total_seconds()
+                            - 10,
+                        )
+                elif sleep_seconds > 0:
                     await asyncio.sleep(sleep_seconds)
 
                 await self._execute_window()
@@ -814,9 +824,34 @@ def main() -> None:
     parser.add_argument(
         "--live", action="store_true", help="Skip live confirmation prompt"
     )
+    parser.add_argument(
+        "--last", action="store_true", help="Reuse last session's config"
+    )
     args = parser.parse_args()
 
-    if args.yes is not None:
+    # Load saved config if --last is passed
+    last_config_path = Path(__file__).parent / "config" / "last_config.json"
+
+    if args.last:
+        if not last_config_path.exists():
+            print("No saved config found. Run without --last first.")
+            sys.exit(1)
+        try:
+            with open(last_config_path) as f:
+                saved = json.load(f)
+            config = BotConfig(
+                yes_assets=saved["yes_assets"],
+                no_assets=saved["no_assets"],
+                contracts=saved["contracts"],
+                stop_width=Decimal(str(saved["stop_width"])),
+                daily_loss_cap=saved.get("daily_loss_cap", 0.0),
+                live_mode=True,
+            )
+        except (json.JSONDecodeError, KeyError) as exc:
+            print(f"Failed to load saved config: {exc}")
+            sys.exit(1)
+
+    elif args.yes is not None:
         yes_assets = [a.strip().upper() for a in args.yes.split(",") if a.strip()]
         no_assets = [a.strip().upper() for a in (args.no or "").split(",") if a.strip()]
         contracts = args.contracts or get_settings().default_contracts
@@ -838,6 +873,21 @@ def main() -> None:
         )
     else:
         config = interactive_startup()
+        # Save config for --last flag
+        try:
+            with open(last_config_path, "w") as f:
+                json.dump(
+                    {
+                        "yes_assets": config.yes_assets,
+                        "no_assets": config.no_assets,
+                        "contracts": config.contracts,
+                        "stop_width": str(config.stop_width),
+                        "daily_loss_cap": config.daily_loss_cap,
+                    },
+                    f,
+                )
+        except Exception as exc:
+            logger.warning("Failed to save last config: %s", exc)
 
     bot = WindowBot(config)
 
