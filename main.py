@@ -237,6 +237,9 @@ class WindowBot:
         )  # assets whose TP filled, waiting for 50/50
         self._asset_mid_prices: dict[str, Decimal] = {}  # latest mid-price per asset
         self._last_skip_reason: str = ""  # ticker-side:price that caused last skip
+        self._skipped_close: datetime | None = (
+            None  # close time we skipped, to prevent re-trigger
+        )
 
     # ------------------------------------------------------------------
     # Main loop
@@ -384,6 +387,7 @@ class WindowBot:
                 "No active markets found for window %s after polling",
                 self.current_window_id,
             )
+            self._skipped_close = None
             return
 
         # Record the actual window close time from the market metadata
@@ -398,6 +402,11 @@ class WindowBot:
                 "Window close time set to %s", self.current_window_close.isoformat()
             )
 
+        # If we already skipped this exact window close time, don't re-check
+        if self._skipped_close and self.current_window_close == self._skipped_close:
+            logger.info("Already skipped this window — waiting for next")
+            return
+
         # Tiny randomized wait so the book has a moment to form
         await asyncio.sleep(random.uniform(0.5, 1.5))
 
@@ -411,7 +420,7 @@ class WindowBot:
                 book = await asyncio.to_thread(
                     self.orderbook.get_maker_prices,
                     market["ticker"],
-                    self.settings.entry_improvement,
+                    Decimal(str(self.settings.entry_improvement)),
                 )
                 planned_entries.append(
                     {
@@ -433,7 +442,7 @@ class WindowBot:
                 book = await asyncio.to_thread(
                     self.orderbook.get_maker_prices,
                     market["ticker"],
-                    self.settings.entry_improvement,
+                    Decimal(str(self.settings.entry_improvement)),
                 )
                 planned_entries.append(
                     {
@@ -468,6 +477,7 @@ class WindowBot:
                 prices_now += f"{asset}={m or 0} "
             if prices_now == self._last_skip_reason:
                 logger.info("Prices unchanged since last skip — skipping window")
+                self._skipped_close = self.current_window_close
                 return
             else:
                 logger.info("Prices changed — re-checking entry conditions")
@@ -490,6 +500,7 @@ class WindowBot:
                     m = self._asset_mid_prices.get(asset)
                     prices += f"{asset}={m or 0} "
                 self._last_skip_reason = prices
+                self._skipped_close = self.current_window_close
                 return
 
         # Risk checks
@@ -511,6 +522,7 @@ class WindowBot:
 
         # Place entries — they either fill (via WS) or expire at market close.
         # The bot stays live streaming Kalshi data the entire time.
+        self._skipped_close = None  # reset skip guard — we're entering
         for plan in planned_entries:
             try:
                 self.order_manager.place_entry(
@@ -816,7 +828,7 @@ class WindowBot:
                 book = await asyncio.to_thread(
                     self.orderbook.get_maker_prices,
                     market["ticker"],
-                    self.settings.entry_improvement,
+                    Decimal(str(self.settings.entry_improvement)),
                 )
             except Exception:
                 logger.exception("Failed to get orderbook for re-entry of %s", asset)
