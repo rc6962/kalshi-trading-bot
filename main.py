@@ -366,18 +366,47 @@ class WindowBot:
             except Exception:
                 logger.exception("Failed to place entry for %s", plan["asset"])
 
-        # Cancel any unfilled take-profits at T-60s so winners ride to $1.00
-        # settlement rather than clipping profit at the 0.98/0.02 TP price.
+        # Live status loop: display prices, positions, and countdown until T-60s
+        # (when unfilled take-profits get canceled).
         if self.current_window_close:
-            remaining = (
-                self.current_window_close - datetime.now(timezone.utc)
-            ).total_seconds()
-            tp_wait = max(0, remaining - 60)
-            if tp_wait > 0:
+            close_time = self.current_window_close
+            while True:
+                now_dt = datetime.now(timezone.utc)
+                remaining = (close_time - now_dt).total_seconds()
+
+                if remaining <= 60:
+                    break
+
+                # Build status line
+                parts = []
+                for asset in sorted(
+                    set(self.config.yes_assets + self.config.no_assets)
+                ):
+                    mid = self._asset_mid_prices.get(asset)
+                    price_str = f"${mid:.4f}" if mid else "?"
+
+                    # Check if this asset has an active filled entry
+                    side_label = ""
+                    for entry in self.order_manager.entries.values():
+                        if entry.asset == asset and entry.filled_count > 0:
+                            side_label = "▲" if entry.side == "bid" else "▼"
+                            break
+
+                    # Check re-entry status
+                    re_flag = "⏳R" if asset in self.reentry_candidates else ""
+
+                    parts.append(f"{asset}={price_str}{side_label}{re_flag}")
+
+                status = " | ".join(parts)
                 logger.info(
-                    "Waiting %.0fs before canceling take-profits at T-60s", tp_wait
+                    "[%s] %s — T-%.0fs until TP cancel, window closes in %.0fs",
+                    self.current_window_id,
+                    status,
+                    max(0, remaining - 60),
+                    remaining,
                 )
-                await asyncio.sleep(tp_wait)
+
+                await asyncio.sleep(10)
 
         self.order_manager.cancel_all_take_profits()
         logger.info("Canceled take-profit orders — survivors ride to $1.00 settlement")
