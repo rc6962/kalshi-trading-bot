@@ -798,12 +798,13 @@ class OrderManager:
             self._cancel_order(entry.order_id, entry.client_order_id)
 
     def reconcile_positions(self) -> None:
-        """Fetch live positions from Kalshi and warn if they don't match our
-        internal OrderManager state.  Trusts Kalshi as source of truth."""
+        """Fetch live positions from Kalshi and fix any mismatches.
+        Trusts Kalshi as source of truth — adjusts internal state
+        to match, clearing stale entries and canceling orphaned TPs."""
         try:
             data = self.rest.get_positions()
         except Exception:
-            return  # will retry on next loop
+            return
 
         kalshi_positions: dict[str, Decimal] = {}
         for pos in data.get("positions", []):
@@ -823,13 +824,49 @@ class OrderManager:
 
         for ticker, exp in expected.items():
             actual = kalshi_positions.get(ticker, Decimal("0"))
-            if actual != exp:
-                logger.warning(
-                    "Position mismatch for %s: Kalshi=%s, bot=%s",
-                    ticker,
-                    actual,
-                    exp,
-                )
+            if actual == exp:
+                continue
+
+            logger.warning(
+                "Position mismatch %s: Kalshi=%s, bot=%s — correcting",
+                ticker,
+                actual,
+                exp,
+            )
+
+            with self._lock:
+                to_clear = []
+                for client_id, entry in list(self.entries.items()):
+                    if entry.ticker != ticker:
+                        continue
+                    if actual == Decimal("0"):
+                        to_clear.append((client_id, entry))
+                    else:
+                        entry.filled_count = min(
+                            entry.filled_count,
+                            abs(actual),
+                        )
+                        if entry.side == "ask":
+                            actual += entry.filled_count
+                        else:
+                            actual -= entry.filled_count
+                        if entry.filled_count <= Decimal("0"):
+                            to_clear.append((client_id, entry))
+
+                for client_id, entry in to_clear:
+                    if entry.tp_order_id and not entry.tp_filled:
+                        self._cancel_order(
+                            entry.tp_order_id,
+                            entry.tp_client_order_id,
+                        )
+                    self.entries.pop(client_id, None)
+                    if entry.order_id:
+                        self.order_id_to_client.pop(entry.order_id, None)
+                        self.entry_order_ids.discard(entry.order_id)
+                    if entry.stop_order_id:
+                        self.order_id_to_client.pop(entry.stop_order_id, None)
+                        self.stop_order_ids.discard(entry.stop_order_id)
+                    logger.info("Cleared stale entry %s %s", entry.asset, entry.ticker)
 
     # ------------------------------------------------------------------
     # Settlement handling
