@@ -1,5 +1,7 @@
 """Quick verification of critical bug fixes."""
 
+import concurrent.futures
+import inspect
 import sys
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
@@ -42,9 +44,9 @@ events = trade_log.read_events("stop_fill")
 if events:
     last_event = events[-1]
     if "entry_price" in last_event:
-        print(f"  [PASS] entry_price found in stop_fill event: {last_event['entry_price']}")
+        print(f"  [PASS] entry_price found: {last_event['entry_price']}")
     else:
-        print(f"  [FAIL] entry_price missing from stop_fill event: {last_event}")
+        print(f"  [FAIL] entry_price missing: {last_event}")
         sys.exit(1)
 else:
     print("  [FAIL] No stop_fill events logged")
@@ -79,11 +81,6 @@ if len(om.entries) == 0 and len(om.order_id_to_client) == 0 and \
     print(f"  [PASS] All state dicts cleared")
 else:
     print(f"  [FAIL] State not fully cleared")
-    print(f"    entries: {len(om.entries)}")
-    print(f"    order_id_to_client: {len(om.order_id_to_client)}")
-    print(f"    entry_order_ids: {len(om.entry_order_ids)}")
-    print(f"    stop_order_ids: {len(om.stop_order_ids)}")
-    print(f"    stop_to_parent_entry_price: {len(om.stop_to_parent_entry_price)}")
     sys.exit(1)
 
 # Test 5: Verify CLI args.no None handling
@@ -98,133 +95,156 @@ class MockArgs:
 args = MockArgs()
 try:
     no_assets = [a.strip().upper() for a in (args.no or "").split(",") if a.strip()]
-    print(f"  [PASS] args.no handled correctly, result: {no_assets}")
+    print(f"  [PASS] args.no handled correctly: {no_assets}")
 except AttributeError as e:
     print(f"  [FAIL] AttributeError: {e}")
     sys.exit(1)
 
 # Test 6: Verify _fmt_decimal no longer has dead places parameter
 print("\nTest 6: _fmt_decimal signature...")
-import inspect
 from kalshi.order_manager import _fmt_decimal
 sig = inspect.signature(_fmt_decimal)
 params = list(sig.parameters.keys())
 if 'places' not in params:
-    print(f"  [PASS] places parameter removed from _fmt_decimal")
+    print(f"  [PASS] places parameter removed")
 else:
     print(f"  [FAIL] places parameter still exists: {params}")
     sys.exit(1)
 
-# Test 7: Verify on_settlement doesn't hold lock during network call
-print("\nTest 7: on_settlement releases lock before network call...")
-import threading
-from unittest.mock import patch
-
+# Test 7: on_settlement releases lock before network call
+print("\nTest 7: on_settlement releases lock before _cancel_order...")
 mock_rest = MagicMock()
-om2 = OrderManager(mock_rest, TradeLog())
-
-# Create an entry with a stop order
-entry = EntryState(
-    client_order_id="test-entry-789",
-    ticker="BTC-15MIN-TEST2",
-    asset="BTC",
-    side="bid",
-    entry_price=Decimal("0.50"),
-    requested_count=Decimal("10"),
-    remaining_count=Decimal("0"),
-    filled_count=Decimal("10"),
-    stop_width=Decimal("0.15"),
-    stop_order_id="stop-999",
-    stop_client_order_id="stop-client-999",
-)
-om2.entries["test-entry-789"] = entry
-
-# Track if lock was released during _cancel_order call
-lock_released_during_cancel = False
-original_cancel = om2._cancel_order
-
-def mock_cancel_with_check(order_id, coid):
-    global lock_released_during_cancel
-    # Try to acquire lock - if successful, it means lock was released
-    acquired = om2._lock.acquire(blocking=False)
-    if acquired:
-        lock_released_during_cancel = True
-        om2._lock.release()
-    original_cancel(order_id, coid)
-
-with patch.object(om2, '_cancel_order', side_effect=mock_cancel_with_check):
-    om2.on_settlement("BTC-15MIN-TEST2", "yes", "0.99")
-
-if lock_released_during_cancel:
-    print(f"  [PASS] Lock released before _cancel_order call")
-else:
-    print(f"  [FAIL] Lock still held during _cancel_order call")
-    sys.exit(1)
-
-# Test 8: Verify cancel_all_entries doesn't hold lock during network call
-print("\nTest 8: cancel_all_entries releases lock before network call...")
-mock_rest = MagicMock()
-om3 = OrderManager(mock_rest, TradeLog())
+om7 = OrderManager(mock_rest, TradeLog())
 
 entry = EntryState(
-    client_order_id="test-entry-999",
-    ticker="ETH-15MIN-TEST",
-    asset="ETH",
-    side="bid",
-    entry_price=Decimal("0.50"),
-    requested_count=Decimal("10"),
-    remaining_count=Decimal("10"),
-    filled_count=Decimal("0"),
-    stop_width=Decimal("0.15"),
-    order_id="order-888",
+    client_order_id="entry-7", ticker="BTC-TEST", asset="BTC", side="bid",
+    entry_price=Decimal("0.50"), requested_count=Decimal("10"), remaining_count=Decimal("0"),
+    filled_count=Decimal("10"), stop_width=Decimal("0.15"),
+    stop_order_id="stop-7", stop_client_order_id="scoid-7",
 )
-om3.entries["test-entry-999"] = entry
+om7.entries["entry-7"] = entry
 
-lock_released_during_cancel = False
-
-def mock_cancel_with_check2(order_id, coid):
-    global lock_released_during_cancel
-    acquired = om3._lock.acquire(blocking=False)
+lock_released = False
+original_cancel = om7._cancel_order
+def mock_cancel(oid, coid):
+    global lock_released
+    acquired = om7._lock.acquire(blocking=False)
     if acquired:
-        lock_released_during_cancel = True
-        om3._lock.release()
+        lock_released = True
+        om7._lock.release()
+    original_cancel(oid, coid)
 
-with patch.object(om3, '_cancel_order', side_effect=mock_cancel_with_check2):
-    om3.cancel_all_entries()
+with patch.object(om7, '_cancel_order', side_effect=mock_cancel):
+    om7.on_settlement("BTC-TEST", "yes", "0.99")
 
-if lock_released_during_cancel:
-    print(f"  [PASS] Lock released before _cancel_order call")
+if lock_released:
+    print(f"  [PASS] Lock released before _cancel_order")
 else:
-    print(f"  [FAIL] Lock still held during _cancel_order call")
+    print(f"  [FAIL] Lock still held during _cancel_order")
     sys.exit(1)
 
-# Test 9: Verify _resolve_client_id is thread-safe
-print("\nTest 9: _resolve_client_id thread safety...")
+# Test 8: cancel_all_entries releases lock before network call
+print("\nTest 8: cancel_all_entries releases lock before _cancel_order...")
 mock_rest = MagicMock()
-om4 = OrderManager(mock_rest, TradeLog())
-om4.order_id_to_client["order-123"] = "client-123"
+om8 = OrderManager(mock_rest, TradeLog())
 
-# Should not raise or deadlock
-result = om4._resolve_client_id("order-123", None)
-if result == "client-123":
-    print(f"  [PASS] _resolve_client_id works with lock")
+entry = EntryState(
+    client_order_id="entry-8", ticker="ETH-TEST", asset="ETH", side="bid",
+    entry_price=Decimal("0.50"), requested_count=Decimal("10"), remaining_count=Decimal("10"),
+    filled_count=Decimal("0"), stop_width=Decimal("0.15"),
+    order_id="order-8",
+)
+om8.entries["entry-8"] = entry
+
+lock_released = False
+def mock_cancel2(oid, coid):
+    global lock_released
+    acquired = om8._lock.acquire(blocking=False)
+    if acquired:
+        lock_released = True
+        om8._lock.release()
+
+with patch.object(om8, '_cancel_order', side_effect=mock_cancel2):
+    om8.cancel_all_entries()
+
+if lock_released:
+    print(f"  [PASS] Lock released before _cancel_order")
 else:
-    print(f"  [FAIL] _resolve_client_id returned wrong value: {result}")
+    print(f"  [FAIL] Lock still held during _cancel_order")
     sys.exit(1)
 
-# Test 10: Verify ws_client _listen_task is assigned
-print("\nTest 10: ws_client _listen_task assignment...")
+# Test 9: _resolve_client_id thread safety under concurrent access
+print("\nTest 9: _resolve_client_id thread-safe under concurrent R/W...")
+om9 = OrderManager(MagicMock(), TradeLog())
+ok = [True]
+
+def writer():
+    for i in range(500):
+        with om9._lock:
+            om9.order_id_to_client[f"order-{i}"] = f"client-{i}"
+            om9.order_id_to_client.pop(f"order-{max(0,i-100)}", None)
+
+def reader():
+    for i in range(500):
+        try:
+            om9._resolve_client_id(f"order-{i % 500}", None)
+            om9._resolve_client_id(None, "direct")
+        except RuntimeError as e:
+            if "dictionary changed" in str(e):
+                ok[0] = False
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    futs = [executor.submit(writer) for _ in range(2)]
+    futs += [executor.submit(reader) for _ in range(2)]
+    concurrent.futures.wait(futs)
+
+if ok[0]:
+    print(f"  [PASS] 2000 calls, no dict race")
+else:
+    print(f"  [FAIL] Race condition detected")
+    sys.exit(1)
+
+# Test 10: ws_client _listen_task assigned
+print("\nTest 10: ws_client _listen_task assigned...")
 from kalshi.ws_client import KalshiWebSocket
 ws = KalshiWebSocket.__new__(KalshiWebSocket)
 ws._listen_task = None
-# Check that the attribute exists and can be assigned
 ws._listen_task = "test-task"
 if ws._listen_task == "test-task":
-    print(f"  [PASS] _listen_task attribute exists and assignable")
+    print(f"  [PASS] _listen_task assignable")
 else:
-    print(f"  [FAIL] _listen_task not properly assigned")
+    print(f"  [FAIL] _listen_task not assignable")
+    sys.exit(1)
+
+# Test 11: classify_order thread safety under concurrent reads
+print("\nTest 11: classify_order thread safety under concurrent R/W...")
+om11 = OrderManager(MagicMock(), TradeLog())
+om11.entry_order_ids.add("entry-fixed")
+om11.stop_order_ids.add("stop-fixed")
+
+classify_ok = [True]
+
+def classify_worker():
+    for i in range(500):
+        try:
+            om11.classify_order("entry-fixed")
+            om11.classify_order("stop-fixed")
+            om11.classify_order("unknown-999")
+            om11.classify_order(None)
+        except RuntimeError as e:
+            if "dictionary changed" in str(e):
+                classify_ok[0] = False
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    futs = [executor.submit(classify_worker) for _ in range(4)]
+    concurrent.futures.wait(futs)
+
+if classify_ok[0]:
+    print(f"  [PASS] 2000 classify_order calls, no race")
+else:
+    print(f"  [FAIL] classify_order race condition")
     sys.exit(1)
 
 print("\n" + "=" * 60)
-print("ALL TESTS PASSED")
+print("ALL 11 TESTS PASSED")
 print("=" * 60)

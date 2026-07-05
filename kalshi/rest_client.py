@@ -53,10 +53,16 @@ class KalshiRestClient:
             path = "/" + path
         full_url = self.base_url + path
         sign_path = self.base_path + path
+
+        # First attempt uses initial headers
         headers = self._headers(method, sign_path)
 
         last_exception: Exception | None = None
         for attempt in range(max_retries + 1):
+            # Regenerate headers on each retry so timestamp is never stale
+            if attempt > 0:
+                headers = self._headers(method, sign_path)
+
             try:
                 response = self.session.request(
                     method=method,

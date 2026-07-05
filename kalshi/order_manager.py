@@ -168,20 +168,21 @@ class OrderManager:
             self._place_ioc_stop(entry)
 
     def on_stop_fill(
-        self,
-        order_id: str | None,
-        client_order_id: str | None,
-        fill_price: str,
-        fill_count: str,
-        fill_side: str = "taker",
-    ) -> None:
+            self,
+            order_id: str | None,
+            client_order_id: str | None,
+            fill_price: str,
+            fill_count: str,
+            fill_side: str = "taker",
+        ) -> None:
         """Handle a stop fill event."""
         # Try to resolve associated entry for richer logging
         asset = "unknown"
         ticker = "unknown"
         side = "unknown"
         parent_entry_client_order_id = None
-        
+        entry_price = None
+
         with self._lock:
             # The stop's client_order_id maps back to the entry via stop_client_order_id
             for entry in self.entries.values():
@@ -192,9 +193,7 @@ class OrderManager:
                     parent_entry_client_order_id = entry.client_order_id
                     break
 
-            # Look up the parent entry price under the same lock: the write
-            # (in _place_ioc_stop) and clear (in on_settlement/reset_window)
-            # are both inside _lock, so the read must be too to avoid races.
+            # Look up the parent entry price while still holding the lock
             entry_price = self.stop_to_parent_entry_price.get(order_id)
 
         if entry_price is None:
