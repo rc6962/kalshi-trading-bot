@@ -17,7 +17,8 @@ class MockRestClient:
 
     def post(self, path: str, json_data: dict[str, Any] | None = None) -> dict[str, Any]:
         self.calls.append(("POST", path, json_data))
-        response = {"order_id": f"order-{self.response_index}"}
+        count = str(json_data.get("count", "0")) if json_data else "0"
+        response = {"order_id": f"order-{self.response_index}", "fill_count": count}
         self.response_index += 1
         return response
 

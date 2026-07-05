@@ -35,6 +35,7 @@ class KalshiWebSocket:
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 10
         self._listen_task: asyncio.Task | None = None
+        self._shutdown_event: asyncio.Event | None = None
 
     def _handshake_headers(self) -> dict[str, str]:
         timestamp = str(int(time.time() * 1000))
@@ -111,7 +112,12 @@ class KalshiWebSocket:
     async def listen(self) -> None:
         """Main listen loop with reconnect."""
         self._listen_task = asyncio.current_task()
+        self._shutdown_event = asyncio.Event()
         while True:
+            # Check shutdown before attempting (re)connect
+            if self._shutdown_event.is_set():
+                break
+
             try:
                 await self.connect()
                 if self.subscribed_tickers:
@@ -130,6 +136,10 @@ class KalshiWebSocket:
                         pass
                     self.websocket = None
 
+            # Check shutdown before attempting reconnect
+            if self._shutdown_event.is_set():
+                break
+
             self._reconnect_attempts += 1
             if self._reconnect_attempts > self._max_reconnect_attempts:
                 logger.error("Max WebSocket reconnect attempts reached")
@@ -137,7 +147,37 @@ class KalshiWebSocket:
 
             wait = min(2**self._reconnect_attempts, 60)
             logger.info("Reconnecting in %ds (attempt %d/%d)...", wait, self._reconnect_attempts, self._max_reconnect_attempts)
-            await asyncio.sleep(wait)
+            # Use shutdown event so close() can interrupt the wait immediately
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=wait)
+            except asyncio.TimeoutError:
+                pass
+
+    async def close(self) -> None:
+        """Close connection gracefully.
+
+        Signals the listen loop to stop via the shutdown event, closes the
+        socket, and cancels the listen task. We then await the task with a
+        short shielded timeout so close() doesn't return until the listen
+        loop has actually unwound (or the timeout elapses).
+        """
+        self._max_reconnect_attempts = 0  # Stop reconnect loop
+        if self._shutdown_event:
+            self._shutdown_event.set()
+        if self.websocket:
+            try:
+                await self.websocket.close()
+            except Exception:
+                pass
+        # Also cancel the task directly for immediate shutdown
+        if self._listen_task:
+            self._listen_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(self._listen_task), timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception:
+                logger.exception("Error awaiting cancelled listen task")
 
     async def _receive_loop(self) -> None:
         """Receive and dispatch messages."""
@@ -174,11 +214,3 @@ class KalshiWebSocket:
         """Register a callback for a message type."""
         self.callbacks[msg_type] = callback
 
-    async def close(self) -> None:
-        """Close connection gracefully."""
-        self._max_reconnect_attempts = 0  # Stop reconnect loop
-        if self.websocket:
-            try:
-                await self.websocket.close()
-            except Exception:
-                pass

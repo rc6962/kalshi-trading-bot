@@ -192,8 +192,11 @@ class OrderManager:
                     parent_entry_client_order_id = entry.client_order_id
                     break
 
-        # Look up the parent entry price
-        entry_price = self.stop_to_parent_entry_price.get(order_id)
+            # Look up the parent entry price under the same lock: the write
+            # (in _place_ioc_stop) and clear (in on_settlement/reset_window)
+            # are both inside _lock, so the read must be too to avoid races.
+            entry_price = self.stop_to_parent_entry_price.get(order_id)
+
         if entry_price is None:
             logger.warning("Stop fill received but no parent entry price found for order_id=%s", order_id)
             entry_price_str = "0.0000"
@@ -405,6 +408,10 @@ class OrderManager:
                     self.order_id_to_client.pop(entry.order_id, None)
                 if entry.stop_order_id:
                     self.order_id_to_client.pop(entry.stop_order_id, None)
+                # Clean up stop_to_parent_entry_price for entries being settled
+                for oid in list(self.stop_to_parent_entry_price.keys()):
+                    if self.order_id_to_client.get(oid) == client_order_id:
+                        del self.stop_to_parent_entry_price[oid]
 
         # Cancel orders outside the lock to avoid blocking during network calls
         for order_id, coid in to_cancel:
